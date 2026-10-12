@@ -38,14 +38,24 @@ class GroqReviewer:
         self.model = settings.GROQ_MODEL if model is None else model
         self.session = session or requests.Session()
 
-    def call(self, prompt: str) -> str:
-        """Sends the prompt and returns the assistant message content."""
+    def unconfigured_reason(self) -> Optional[str]:
+        """Reason this provider cannot be called, or None when it is ready.
+
+        Shared with /review (app.main) so a missing key becomes a clear
+        status instead of a pointless network call.
+        """
         if not self.api_key or self.api_key.strip() in (
             "", "your_groq_api_key_here", "gsk_your_key_here",
         ):
-            msg = "GROQ_API_KEY is not configured; set it or use LLM_PROVIDER=gemini."
-            logger.error(msg)
-            raise GroqError(msg)
+            return "GROQ_API_KEY is not configured; set it or use LLM_PROVIDER=gemini."
+        return None
+
+    def call(self, prompt: str) -> str:
+        """Sends the prompt and returns the assistant message content."""
+        reason = self.unconfigured_reason()
+        if reason:
+            logger.error(reason)
+            raise GroqError(reason)
 
         payload = {
             "model": self.model,

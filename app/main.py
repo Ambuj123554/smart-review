@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, status
@@ -6,21 +7,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.analyzer.engine import ASTAnalyzer
 from app.github.webhooks import router as github_webhook_router
-from app.ai.reviewer import GeminiReviewer
+from app.ai.providers import get_reviewer
+from app.ai.reviewer import build_review_prompt, parse_findings_response
 from app.database.db import DatabaseManager
 from app.schemas.review import (
     ReviewRequest,
     ReviewResponse,
     ReviewSummary,
     ReviewListResponse,
-    ReviewHistoryItem
+    ReviewHistoryItem,
+    Finding
 )
+
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI application
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="AI-Powered Code Review Engine using FastAPI, AST analysis, and Google Gemini API."
+    description="AI-Powered Code Review Engine using FastAPI, AST analysis, and the configured LLM provider (Gemini or Groq)."
 )
 
 def _cors_settings(origins_raw: str) -> dict:
@@ -86,7 +91,6 @@ def health_check():
 
 # Initialized lazily so test fixtures can override settings before first use.
 ast_analyzer: ASTAnalyzer | None = None
-ai_reviewer: GeminiReviewer | None = None
 db_manager: DatabaseManager | None = None
 
 
@@ -104,11 +108,58 @@ def _get_ast_analyzer() -> ASTAnalyzer:
     return ast_analyzer
 
 
-def _get_ai_reviewer() -> GeminiReviewer:
-    global ai_reviewer
-    if ai_reviewer is None:
-        ai_reviewer = GeminiReviewer(api_key=settings.GEMINI_API_KEY)
-    return ai_reviewer
+def _get_ai_reviewer():
+    """Configured LLM reviewer.
+
+    Uses the same provider selection as the webhook path
+    (app.ai.providers.get_reviewer: LLM_PROVIDER=gemini|groq). Built per
+    request so settings overrides made by tests always apply.
+    """
+    return get_reviewer()
+
+
+def _run_ai_review(code: str, rule_findings: list[Finding]) -> tuple[list[Finding], str]:
+    """Runs the configured LLM on the code. Never raises.
+
+    Returns (ai_findings, ai_status) where ai_status is "ok" on success or
+    "error: <reason>" when the provider is unusable, the call failed, or the
+    model returned invalid output. Failures are logged as warnings so a
+    broken LLM setup is visible instead of silently producing no findings.
+    """
+    try:
+        reviewer = _get_ai_reviewer()
+    except ValueError as err:  # unknown LLM_PROVIDER: fail loudly, not silently
+        logger.warning("AI review skipped: %s", err)
+        return [], f"error: {err}"
+
+    provider = type(reviewer).__name__
+
+    reason = reviewer.unconfigured_reason()
+    if reason:
+        logger.warning("AI review skipped (%s): %s", provider, reason)
+        return [], f"error: {reason}"
+
+    try:
+        raw = reviewer.call(build_review_prompt(code, rule_findings))
+    except Exception as err:  # noqa: BLE001 - one bad call must not kill /review
+        logger.warning("AI review failed (%s): %s", provider, err)
+        return [], "error: " + " ".join(str(err).split())
+
+    if not isinstance(raw, str) or not raw.strip():
+        logger.warning("AI review failed (%s): empty response from LLM.", provider)
+        return [], "error: empty response from LLM"
+
+    findings = parse_findings_response(raw)
+    if findings is None:
+        logger.warning(
+            "AI review failed (%s): invalid output, expected a JSON array of "
+            "findings. Response began with: %.200r",
+            provider,
+            raw.strip(),
+        )
+        return [], "error: LLM returned invalid output (expected JSON array)"
+
+    return findings, "ok"
 
 
 @app.post("/review", response_model=ReviewResponse, tags=["Code Review"])
@@ -127,8 +178,10 @@ def analyze_code(request: ReviewRequest):
     # 1. Deterministic AST Rule Analysis
     rule_findings = _get_ast_analyzer().analyze(request.code)
 
-    # 2. Contextual AI Analysis via Gemini (with graceful fallback if unconfigured/fails)
-    ai_findings = _get_ai_reviewer().analyze(request.code, rule_findings)
+    # 2. Contextual AI Analysis via the configured provider (same selection
+    #    as the webhook path); failures degrade to ai_status="error: ..."
+    #    instead of a 500 or silently empty findings.
+    ai_findings, ai_status = _run_ai_review(request.code, rule_findings)
 
     # 3. Calculate Aggregated Summary
     summary = _calculate_summary(rule_findings, ai_findings)
@@ -144,7 +197,8 @@ def analyze_code(request: ReviewRequest):
         identifier=identifier,
         summary=summary,
         rule_based_findings=rule_findings,
-        ai_findings=ai_findings
+        ai_findings=ai_findings,
+        ai_status=ai_status
     )
 
     # 5. Persist to SQLite Database

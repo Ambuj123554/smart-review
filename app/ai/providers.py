@@ -1,7 +1,9 @@
 """Provider selection: returns the configured LLM reviewer (gemini | groq).
 
-Both reviewers expose the same `call(prompt) -> str` interface, so callers
-(DiffReviewer) and the findings validation downstream are provider-agnostic.
+Both reviewers expose the same `call(prompt) -> str` interface and an
+`unconfigured_reason() -> str | None` check, so callers (DiffReviewer,
+/Review in app.main) and the findings validation downstream are
+provider-agnostic.
 """
 from app.config import settings
 

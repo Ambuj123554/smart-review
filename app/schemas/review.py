@@ -37,6 +37,10 @@ class ReviewResponse(BaseModel):
     summary: ReviewSummary
     rule_based_findings: List[Finding]
     ai_findings: List[Finding]
+    ai_status: str = Field(
+        "ok",
+        description="AI review outcome: 'ok' or 'error: <reason>'",
+    )
 
 
 class ReviewHistoryItem(BaseModel):
