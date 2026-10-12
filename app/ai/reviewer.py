@@ -14,6 +14,10 @@ class GeminiReviewer:
     def __init__(self, api_key: str = None):
         self.api_key = api_key or settings.GEMINI_API_KEY
 
+    def call(self, prompt: str) -> str:
+        """Provider-neutral entry point (same interface as GroqReviewer.call)."""
+        return self._call_gemini_api(prompt)
+
     def analyze(self, code: str, rule_findings: List[Finding]) -> List[Finding]:
         """Sends code and AST findings to Gemini for contextual analysis."""
         if not self.api_key or self.api_key.strip() in ("", "your_gemini_api_key_here"):

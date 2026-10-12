@@ -9,6 +9,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.ai.guardrails import fence_code
+from app.ai.providers import get_reviewer
 from app.schemas.review import Finding
 from app.github.diff import FilePatch
 
@@ -42,8 +43,10 @@ class DiffReviewResult:
 class DiffReviewer:
     """Reviews one FilePatch via the Gemini model, line-validated."""
 
-    def __init__(self, reviewer: Optional[GeminiReviewer] = None):
-        self.reviewer = reviewer or GeminiReviewer(api_key=None)
+    def __init__(self, reviewer: Optional[Any] = None):
+        # reviewer exposes call(prompt) -> str; defaults to the provider
+        # selected by LLM_PROVIDER (gemini or groq).
+        self.reviewer = reviewer or get_reviewer()
 
     def review_file(
         self,
@@ -58,7 +61,7 @@ class DiffReviewer:
             return result
 
         prompt = self._build_prompt(file_patch.path, snippet)
-        raw = self.reviewer._call_gemini_api(prompt)
+        raw = self.reviewer.call(prompt)
 
         if not raw:
             result.dropped_invalid_json = True

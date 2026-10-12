@@ -91,3 +91,102 @@ def test_merge_dedupes_within_llm_duplicate_lines():
     merged = _merge_findings("f.py", [], llm)
     assert len(merged) == 1
     assert merged[0]["message"] == "first"
+
+
+# ------------------- Task 1: extension skip + truncation -------------------
+
+def test_non_code_extension_skips_content_fetch():
+    client = _client_with_source("some text")
+    fp = FilePatch(path="docs/README.md",
+                   added_lines=[AddedLine(line=3, content="new docs line")])
+    out = _ast_findings_for_file(client, "o/r", "sha", fp, ASTAnalyzer())
+    assert out == []
+    client.get_file_content.assert_not_called()
+
+
+def test_unsupported_code_extension_skips_content_fetch():
+    client = _client_with_source("x = 1")
+    fp = FilePatch(path="app.js",
+                   added_lines=[AddedLine(line=1, content="var x = 1;")])
+    out = _ast_findings_for_file(client, "o/r", "sha", fp, ASTAnalyzer())
+    assert out == []
+    client.get_file_content.assert_not_called()
+
+
+def test_supported_python_extension_fetches_content():
+    client = _client_with_source(SOURCE)
+    fp = FilePatch(path="pkg/module.PY",  # case-insensitive extension check
+                   added_lines=[AddedLine(line=2, content="x")])
+    out = _ast_findings_for_file(client, "o/r", "sha", fp, ASTAnalyzer())
+    assert len(out) == 1  # eval() on added line 2
+    client.get_file_content.assert_called_once_with("o/r", "pkg/module.PY", "sha")
+
+
+def test_max_files_per_pr_default_is_20():
+    from app.config import settings
+    # conftest never sets MAX_FILES_PER_PR, so the env default applies.
+    assert settings.MAX_FILES_PER_PR == 20
+
+
+def _hermetic_pipeline(monkeypatch, files):
+    """Mocks every network/LLM/DB touchpoint of _process_review."""
+    from unittest.mock import MagicMock
+    import app.github.webhooks as wh
+    fake_client = MagicMock()
+    fake_client.get_pr_files.return_value = files
+    fake_client.get_file_content.return_value = None
+    monkeypatch.setattr(wh, "GitHubApiClient", lambda: fake_client)
+    monkeypatch.setattr(
+        wh, "DiffReviewer",
+        lambda: MagicMock(review_file=lambda fp: wh.DiffReviewResult(fp.path)),
+    )
+    monkeypatch.setattr(wh, "ReviewPoster", MagicMock)
+    monkeypatch.setattr(wh, "DatabaseManager", MagicMock)
+    return wh
+
+
+def _many_files(n):
+    return [
+        {"filename": f"f{i}.py", "status": "modified",
+         "patch": "@@ -1 +1,2 @@\n-a\n+b\n"}
+        for i in range(n)
+    ]
+
+
+def test_truncated_file_count_logs_warning_with_pr_number(monkeypatch, caplog):
+    import logging
+    wh = _hermetic_pipeline(monkeypatch, _many_files(25))  # cap is 20
+    with caplog.at_level(logging.WARNING, logger="app.github.webhooks"):
+        wh._process_review("o/r", 4242, "sha", None, "alice")
+    warnings = [m for m in caplog.messages if "truncated" in m]
+    assert warnings, "expected a truncation warning"
+    assert any("o/r#4242" in m for m in warnings), caplog.messages
+
+
+def test_exactly_at_file_cap_is_not_reported_truncated(monkeypatch, caplog):
+    """A PR with exactly MAX_FILES_PER_PR changed files is complete, not
+    truncated — the warning must not fire."""
+    import logging
+    from app.config import settings
+    wh = _hermetic_pipeline(monkeypatch, _many_files(settings.MAX_FILES_PER_PR))
+    with caplog.at_level(logging.WARNING, logger="app.github.webhooks"):
+        wh._process_review("o/r", 7, "sha", None, None)
+    assert not [m for m in caplog.messages if "truncated" in m], caplog.messages
+
+
+def test_line_cap_truncation_logs_warning_with_pr_number(monkeypatch, caplog):
+    import logging
+    from app.config import settings
+    # Each file adds 2 lines; a global budget of 1 forces per-file truncation.
+    files = [
+        {"filename": f"f{i}.py", "status": "modified",
+         "patch": "@@ -1 +1,3 @@\n-a\n+b\n+c\n"}
+        for i in range(2)
+    ]
+    wh = _hermetic_pipeline(monkeypatch, files)
+    monkeypatch.setattr(settings, "GITHUB_MAX_LINES", 1)  # force line cap
+    with caplog.at_level(logging.WARNING, logger="app.github.webhooks"):
+        wh._process_review("o/r", 99, "sha", None, None)
+    warnings = [m for m in caplog.messages
+                if "GITHUB_MAX_LINES" in m and "o/r#99" in m]
+    assert warnings, caplog.messages

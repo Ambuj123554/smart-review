@@ -15,11 +15,16 @@ class Settings:
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     
+    # LLM provider selection: "gemini" (default) or "groq"
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "gemini")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    
     # GitHub API settings
     GITHUB_WEBHOOK_SECRET: str = os.getenv("GITHUB_WEBHOOK_SECRET", "")
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
     # Guard rails for very large PRs (0 = no cap)
-    GITHUB_MAX_FILES: int = int(os.getenv("GITHUB_MAX_FILES", "50"))
+    MAX_FILES_PER_PR: int = int(os.getenv("MAX_FILES_PER_PR", "20"))
     GITHUB_MAX_LINES: int = int(os.getenv("GITHUB_MAX_LINES", "3000"))
     
     # Database configuration

@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Marker so we can recognize our own comments among human ones.
 BOT_MARKER = "<!-- smart-review-assistant -->"
 
+# Severity order used for the overall-risk rollup (highest wins).
+RISK_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 2.0
 
@@ -52,12 +55,17 @@ class ReviewPoster:
         pr_number: int,
         head_sha: str,
         findings: List[Dict[str, Any]],
+        files_analysed: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Posts findings as inline comments in one review.
 
         Each finding dict needs: path, line, message, and optionally
         suggestion, severity, category. Findings are deduplicated against
         existing comments first (sync pushes produce the same lines again).
+        When `files_analysed` is given, one PR-level summary comment
+        (files, severity/category counts, overall risk) is posted after a
+        successful inline review; it is never posted when there are no
+        findings (early return) or when the inline post fails.
         Returns the GitHub review JSON, or None when everything was
         duplicate/nothing to post.
         """
@@ -104,7 +112,24 @@ class ReviewPoster:
             "body": self._summary_body(findings, comments),
             "comments": comments,
         }
-        return self._post_with_retry(repo_full_name, pr_number, payload)
+        review = self._post_with_retry(repo_full_name, pr_number, payload)
+
+        # Summary comment: only after a successful inline review, and only
+        # when the caller told us how many files were analysed (the real
+        # pipeline always does).
+        if files_analysed is not None:
+            try:
+                self._post_summary_comment(
+                    repo_full_name,
+                    pr_number,
+                    self._summary_comment_body(findings, files_analysed),
+                )
+            except GitHubPostingError as err:
+                logger.warning(
+                    "Inline review posted but summary comment failed for %s#%s: %s",
+                    repo_full_name, pr_number, err,
+                )
+        return review
 
     # --------------------------- internals --------------------------------
 
@@ -155,6 +180,62 @@ class ReviewPoster:
             f"🤖 **Smart Review Assistant** reviewed {len(findings)} issue(s) "
             f"({summary}). {len(comments)} inline comment(s) below, sorted by "
             f"the author's added lines in this PR."
+        )
+
+    @staticmethod
+    def _overall_risk(findings: List[Dict[str, Any]]) -> str:
+        """Highest severity present (CRITICAL > HIGH > MEDIUM > LOW > INFO)."""
+        sevs = {str(f.get("severity", "INFO")).upper() for f in findings}
+        for level in RISK_ORDER:
+            if level in sevs:
+                return level
+        return "NONE"
+
+    def _summary_comment_body(
+        self, findings: List[Dict[str, Any]], files_analysed: int
+    ) -> str:
+        """One PR-level comment: files analysed, severity/category counts,
+        and the overall risk level."""
+        sev_counts: Dict[str, int] = {}
+        cat_counts: Dict[str, int] = {}
+        for f in findings:
+            sev = str(f.get("severity", "INFO")).upper()
+            cat = str(f.get("category", "Code Quality"))
+            sev_counts[sev] = sev_counts.get(sev, 0) + 1
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        risk = self._overall_risk(findings)
+        sev_str = ", ".join(
+            f"{k}: {sev_counts[k]}" for k in RISK_ORDER if k in sev_counts
+        )
+        cat_str = ", ".join(
+            f"{k}: {v}" for k, v in sorted(cat_counts.items())
+        )
+        return (
+            f"{BOT_MARKER}\n"
+            "📊 **Smart Review Assistant — PR review summary**\n"
+            f"- Files analysed: {files_analysed}\n"
+            f"- Findings: {len(findings)} total\n"
+            f"- By severity: {sev_str}\n"
+            f"- By category: {cat_str}\n"
+            f"- Overall risk: **{risk}**"
+        )
+
+    def _post_summary_comment(
+        self, repo_full_name: str, pr_number: int, body: str
+    ) -> Optional[Dict[str, Any]]:
+        """Posts ONE PR-level comment (issue-comment API) with retries."""
+        url = (
+            f"{self.client.base_url}/repos/{repo_full_name}"
+            f"/issues/{pr_number}/comments"
+        )
+        resp = self._retry_request("POST", url, json={"body": body})
+        if resp.status_code in (200, 201):
+            logger.info("Summary comment posted for %s#%s.", repo_full_name, pr_number)
+            return resp.json()
+        logger.error("Summary comment rejected for %s#%s (%d): %s",
+                     repo_full_name, pr_number, resp.status_code, resp.text[:200])
+        raise GitHubPostingError(
+            f"GitHub rejected summary comment: {resp.status_code} {resp.text[:200]}"
         )
 
     def _existing_bot_comments(self, repo_full_name: str, pr_number: int) -> List[Dict[str, Any]]:

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, status
@@ -64,6 +65,12 @@ def extract_pr_info(
     return repo_full_name, pr_number, head_sha, installation_id, author
 
 
+# Full-file source is only fetched for extensions the AST engine can parse
+# (Python today). Everything else still gets LLM review of its added lines,
+# but we don't waste an API call fetching content we cannot analyse.
+SUPPORTED_AST_EXTENSIONS = frozenset({".py"})
+
+
 def _ast_findings_for_file(
     client: GitHubApiClient,
     repo_full_name: str,
@@ -79,6 +86,11 @@ def _ast_findings_for_file(
     as the LLM path (AST line numbers must map onto changed lines, otherwise
     the comment could not be placed inline).
     """
+    ext = os.path.splitext(file_patch.path)[1].lower()
+    if ext not in SUPPORTED_AST_EXTENSIONS:
+        logger.debug("Skipping content fetch for unsupported file type: %s",
+                     file_patch.path)
+        return []
     content = client.get_file_content(repo_full_name, file_patch.path, head_sha)
     if not content:
         return []
@@ -145,24 +157,41 @@ def _process_review(
 
     client = GitHubApiClient()
     try:
+        # Fetch one more than the cap so "truncated" can be distinguished
+        # from "exactly at the cap" (len == MAX_FILES_PER_PR is not a truncation).
         files = client.get_pr_files(
             repo_full_name,
             pr_number,
-            max_files=settings.GITHUB_MAX_FILES,
+            max_files=settings.MAX_FILES_PER_PR + 1,
         )
     except GitHubApiError as err:
         logger.error("Failed to fetch changed files for %s#%s: %s",
                      repo_full_name, pr_number, err)
         return []
 
+    if settings.MAX_FILES_PER_PR > 0 and len(files) > settings.MAX_FILES_PER_PR:
+        logger.warning(
+            "PR %s#%s truncated: %d+ files changed (MAX_FILES_PER_PR=%d); "
+            "remaining changed files were not analysed.",
+            repo_full_name, pr_number, len(files), settings.MAX_FILES_PER_PR,
+        )
+        files = files[:settings.MAX_FILES_PER_PR]
+
     parsed = parse_files_payload(
         files,
-        max_files=settings.GITHUB_MAX_FILES,
+        max_files=settings.MAX_FILES_PER_PR,
         max_lines=settings.GITHUB_MAX_LINES,
     )
     if not parsed:
         logger.info("No analysable diff content for %s#%s.", repo_full_name, pr_number)
         return []
+
+    if any(fp.truncated for fp in parsed):
+        logger.warning(
+            "PR %s#%s truncated: hit GITHUB_MAX_LINES=%d; later hunks "
+            "were not analysed.",
+            repo_full_name, pr_number, settings.GITHUB_MAX_LINES,
+        )
 
     reviewer = DiffReviewer()
     ast_analyzer = ASTAnalyzer()
@@ -197,7 +226,10 @@ def _process_review(
     # Post ONE consolidated review with inline comments; duplicates from
     # previous pushes (same path/line/body) are skipped internally.
     try:
-        ReviewPoster().post_review(repo_full_name, pr_number, head_sha, findings_payload)
+        ReviewPoster().post_review(
+            repo_full_name, pr_number, head_sha, findings_payload,
+            files_analysed=len(parsed),
+        )
     except GitHubPostingError as err:
         logger.error("Could not post review for %s#%s: %s", repo_full_name, pr_number, err)
 

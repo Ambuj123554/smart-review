@@ -170,6 +170,74 @@ def test_dedupe_keys_on_message_not_explanation_or_suggestion(poster, client):
     assert sent["comments"][0]["line"] == 2
 
 
+def test_summary_comment_posted_after_inline_review(poster, client):
+    """After the inline review, ONE PR-level summary comment with files,
+    severity/category counts and overall risk."""
+    client.session.request.side_effect = [
+        _resp(200, []),           # existing comments
+        _resp(201, {"id": 1}),    # inline review
+        _resp(201, {"id": 9}),    # summary comment
+    ]
+    findings = [
+        _finding(severity="CRITICAL", category="Security", line=1),
+        _finding(severity="LOW", category="Style", line=2),
+    ]
+    result = poster.post_review("o/r", 7, "sha", findings, files_analysed=5)
+    assert result == {"id": 1}  # returns the inline review result
+
+    assert client.session.request.call_count == 3
+    method, url = client.session.request.call_args.args[:2]
+    assert method == "POST"
+    assert url.endswith("/repos/o/r/issues/7/comments")  # PR-level comment
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Files analysed: 5" in body
+    assert "Findings: 2 total" in body
+    assert "CRITICAL: 1" in body and "LOW: 1" in body       # by severity
+    assert "Security: 1" in body and "Style: 1" in body      # by category
+    assert "Overall risk: **CRITICAL**" in body               # highest wins
+
+
+def test_overall_risk_medium_when_no_higher_severities(poster, client):
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),
+        _resp(201, {"id": 9}),
+    ]
+    poster.post_review("o/r", 7, "sha", [_finding(severity="MEDIUM")],
+                       files_analysed=1)
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Overall risk: **MEDIUM**" in body
+
+
+def test_no_summary_when_no_findings(poster, client):
+    """Spec: don't post a summary when there are no findings."""
+    assert poster.post_review("o/r", 7, "sha", [], files_analysed=5) is None
+    client.session.request.assert_not_called()  # no inline, no summary
+
+
+def test_no_summary_when_all_comments_are_duplicates(poster, client):
+    existing = _existing(BOT_MARKER + "\n**[HIGH] Security:** problem")
+    client.session.request.return_value = _resp(200, [existing])
+    result = poster.post_review("o/r", 7, "sha", [_finding()], files_analysed=3)
+    assert result is None
+    # Only the GET for existing comments; no review and no summary POST.
+    assert client.session.request.call_count == 1
+    assert client.session.request.call_args.args[0] == "GET"
+
+
+def test_summary_failure_does_not_fail_posted_review(poster, client):
+    """Inline review already succeeded; a broken summary endpoint must only
+    log a warning, not raise away the successful result."""
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),
+        _resp(500, {"error": "boom"}),
+    ]
+    result = poster.post_review("o/r", 7, "sha", [_finding()], files_analysed=2)
+    assert result == {"id": 1}
+    assert client.session.request.call_count == 3
+
+
 def test_summary_body_contains_severity_counts(poster, client):
     client.session.request.return_value = _resp(201, {"id": 6})
     findings = [
