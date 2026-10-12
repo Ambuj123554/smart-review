@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.analyzer.engine import ASTAnalyzer
+from app.github.webhooks import router as github_webhook_router
 from app.ai.reviewer import GeminiReviewer
 from app.database.db import DatabaseManager
 from app.schemas.review import (
@@ -22,19 +23,29 @@ app = FastAPI(
     description="AI-Powered Code Review Engine using FastAPI, AST analysis, and Google Gemini API."
 )
 
-# Add CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _cors_settings(origins_raw: str) -> dict:
+    """Builds CORSMiddleware kwargs from a comma-separated origins string.
 
-# Initialize Services
-ast_analyzer = ASTAnalyzer()
-ai_reviewer = GeminiReviewer()
-db_manager = DatabaseManager()
+    Never combines allow_origins=["*"] with allow_credentials=True, which
+    browsers reject and which would expose cookies to any site.
+    """
+    origins = [o.strip() for o in origins_raw.split(",") if o.strip()]
+    if not origins:
+        origins = ["http://localhost:8000"]
+    return {
+        "allow_origins": origins,
+        "allow_credentials": "*" not in origins,
+        "allow_methods": ["GET", "POST"],
+        "allow_headers": ["Content-Type", "X-Hub-Signature-256", "X-GitHub-Event"],
+    }
+
+
+app.add_middleware(CORSMiddleware, **_cors_settings(settings.ALLOWED_ORIGINS))
+
+# Register GitHub webhook routes
+app.include_router(github_webhook_router)
+
+
 
 
 def _calculate_summary(rule_findings, ai_findings) -> ReviewSummary:
@@ -73,6 +84,33 @@ def health_check():
     }
 
 
+# Initialized lazily so test fixtures can override settings before first use.
+ast_analyzer: ASTAnalyzer | None = None
+ai_reviewer: GeminiReviewer | None = None
+db_manager: DatabaseManager | None = None
+
+
+def _get_db_manager() -> DatabaseManager:
+    global db_manager
+    if db_manager is None:
+        db_manager = DatabaseManager()
+    return db_manager
+
+
+def _get_ast_analyzer() -> ASTAnalyzer:
+    global ast_analyzer
+    if ast_analyzer is None:
+        ast_analyzer = ASTAnalyzer()
+    return ast_analyzer
+
+
+def _get_ai_reviewer() -> GeminiReviewer:
+    global ai_reviewer
+    if ai_reviewer is None:
+        ai_reviewer = GeminiReviewer(api_key=settings.GEMINI_API_KEY)
+    return ai_reviewer
+
+
 @app.post("/review", response_model=ReviewResponse, tags=["Code Review"])
 def analyze_code(request: ReviewRequest):
     """
@@ -87,10 +125,10 @@ def analyze_code(request: ReviewRequest):
         )
 
     # 1. Deterministic AST Rule Analysis
-    rule_findings = ast_analyzer.analyze(request.code)
+    rule_findings = _get_ast_analyzer().analyze(request.code)
 
     # 2. Contextual AI Analysis via Gemini (with graceful fallback if unconfigured/fails)
-    ai_findings = ai_reviewer.analyze(request.code, rule_findings)
+    ai_findings = _get_ai_reviewer().analyze(request.code, rule_findings)
 
     # 3. Calculate Aggregated Summary
     summary = _calculate_summary(rule_findings, ai_findings)
@@ -111,7 +149,7 @@ def analyze_code(request: ReviewRequest):
 
     # 5. Persist to SQLite Database
     try:
-        db_manager.save_review(response, request.code)
+        _get_db_manager().save_review(response, request.code)
     except Exception as err:
         # DB failure should not prevent returning analysis results to user
         print(f"Warning: Failed to save review to SQLite database: {err}")
@@ -122,17 +160,23 @@ def analyze_code(request: ReviewRequest):
 @app.get("/reviews", response_model=ReviewListResponse, tags=["Review History"])
 def get_review_history():
     """Retrieves all past code reviews stored in SQLite database."""
-    reviews = db_manager.get_all_reviews()
+    reviews = _get_db_manager().get_all_reviews()
     return ReviewListResponse(
         total_reviews=len(reviews),
         reviews=reviews
     )
 
 
+@app.get("/stats", tags=["Analytics"])
+def get_stats():
+    """Aggregated counts of PR findings by severity, category, and repo."""
+    return _get_db_manager().get_stats()
+
+
 @app.get("/reviews/{review_id}", response_model=ReviewHistoryItem, tags=["Review History"])
 def get_review_by_id(review_id: str):
     """Retrieves details of a specific past review by ID."""
-    review = db_manager.get_review_by_id(review_id)
+    review = _get_db_manager().get_review_by_id(review_id)
     if not review:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

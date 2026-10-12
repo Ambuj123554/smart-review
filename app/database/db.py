@@ -1,14 +1,48 @@
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import List, Optional
 from app.config import settings
 from app.schemas.review import ReviewResponse, ReviewHistoryItem, ReviewSummary, Finding
+
+
+PR_FINDINGS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS pr_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_full_name TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        author TEXT,
+        head_sha TEXT NOT NULL,
+        reviewed_at TEXT NOT NULL,
+        UNIQUE (repo_full_name, pr_number, head_sha)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pr_reviews_repo_time
+        ON pr_reviews (repo_full_name, reviewed_at);
+
+    CREATE TABLE IF NOT EXISTS pr_findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pr_review_id INTEGER NOT NULL REFERENCES pr_reviews(id),
+        file_path TEXT NOT NULL,
+        line INTEGER NOT NULL,
+        severity TEXT NOT NULL,
+        category TEXT NOT NULL,
+        message TEXT NOT NULL,
+        suggestion TEXT,
+        explanation TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pr_findings_sev_cat
+        ON pr_findings (severity, category);
+    CREATE INDEX IF NOT EXISTS idx_pr_findings_review
+        ON pr_findings (pr_review_id);
+"""
 
 
 class DatabaseManager:
     """SQLite Database Manager for persisting and retrieving review history."""
 
     def __init__(self, db_path: str = None):
+        # Read at call time (not import time) so test fixtures can override settings.DATABASE_PATH first
         self.db_path = db_path or settings.DATABASE_PATH
         self.init_db()
 
@@ -18,7 +52,7 @@ class DatabaseManager:
         return conn
 
     def init_db(self) -> None:
-        """Create the reviews table if it does not exist."""
+        """Create the reviews and per-PR tables if they do not exist."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -37,7 +71,84 @@ class DatabaseManager:
                     code_snippet TEXT
                 )
             """)
+            conn.executescript(PR_FINDINGS_SCHEMA)
             conn.commit()
+
+    def save_pr_review(
+        self,
+        repo_full_name: str,
+        pr_number: int,
+        head_sha: str,
+        author: Optional[str],
+        findings: List[dict],
+    ) -> int:
+        """Persists one PR review and its findings.
+
+        `findings` is a list of dicts with keys:
+        file_path, line, severity, category, message, and optionally
+        suggestion, explanation (kept NULL when absent).
+        Returns the pr_reviews row id.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO pr_reviews
+                    (repo_full_name, pr_number, author, head_sha, reviewed_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (repo_full_name, pr_number, author, head_sha, now),
+            )
+            cursor.execute(
+                """
+                SELECT id FROM pr_reviews
+                WHERE repo_full_name = ? AND pr_number = ? AND head_sha = ?
+                """,
+                (repo_full_name, pr_number, head_sha),
+            )
+            row = cursor.fetchone()
+            existing_id = row[0] if row else None
+            pr_review_id = existing_id if existing_id is not None else cursor.lastrowid
+
+            # Idempotency: the same (repo, pr, sha) already recorded means a
+            # duplicate delivery or a re-review of the same commit; keep the
+            # first record rather than double-counting findings.
+            if existing_id is not None:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM pr_findings WHERE pr_review_id = ?",
+                    (existing_id,),
+                )
+                already_saved = cursor.fetchone()[0]
+                if already_saved > 0:
+                    conn.commit()
+                    return existing_id  # duplicate: skip, keep first snapshot
+            elif not findings:
+                conn.commit()
+                return pr_review_id  # nothing to insert after all
+
+            for f in findings:
+                cursor.execute(
+                    """
+                    INSERT INTO pr_findings
+                        (pr_review_id, file_path, line, severity, category,
+                         message, suggestion, explanation, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pr_review_id,
+                        f["file_path"],
+                        f["line"],
+                        f["severity"],
+                        f["category"],
+                        f["message"],
+                        f.get("suggestion"),
+                        f.get("explanation"),
+                        now,
+                    ),
+                )
+            conn.commit()
+            return pr_review_id
 
     def save_review(self, response: ReviewResponse, code: str = "") -> None:
         """Stores a completed review into SQLite database."""
@@ -95,6 +206,33 @@ class DatabaseManager:
                     )
                 )
         return reviews
+
+    def get_stats(self) -> dict:
+        """Aggregate counts for GET /stats: by severity, category, and repo."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            by_severity = dict(cursor.execute(
+                "SELECT severity, COUNT(*) FROM pr_findings GROUP BY severity"
+            ).fetchall())
+            by_category = dict(cursor.execute(
+                "SELECT category, COUNT(*) FROM pr_findings GROUP BY category"
+            ).fetchall())
+            by_repo = dict(cursor.execute(
+                """
+                SELECT r.repo_full_name, COUNT(*)
+                FROM pr_findings f
+                JOIN pr_reviews r ON r.id = f.pr_review_id
+                GROUP BY r.repo_full_name
+                """
+            ).fetchall())
+
+            return {
+                "total_findings": sum(by_severity.values()),
+                "by_severity": by_severity,
+                "by_category": by_category,
+                "by_repo": by_repo,
+            }
 
     def get_review_by_id(self, review_id: str) -> Optional[ReviewHistoryItem]:
         """Retrieves a single review record by review_id."""

@@ -43,3 +43,6 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+
+# Docker
+.docker/

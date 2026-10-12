@@ -36,7 +36,7 @@ class GeminiReviewer:
             from google import genai
             client = genai.Client(api_key=self.api_key)
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model=settings.GEMINI_MODEL,
                 contents=prompt,
             )
             return response.text
@@ -47,7 +47,7 @@ class GeminiReviewer:
         try:
             import google.generativeai as genai_legacy
             genai_legacy.configure(api_key=self.api_key)
-            model = genai_legacy.GenerativeModel("gemini-1.5-flash")
+            model = genai_legacy.GenerativeModel(settings.GEMINI_MODEL)
             response = model.generate_content(prompt)
             return response.text
         except ImportError:
