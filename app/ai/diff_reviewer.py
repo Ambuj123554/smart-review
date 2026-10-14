@@ -1,7 +1,8 @@
 """LLM-driven review of a single changed file's added lines.
 
-Uses the existing GeminiReviewer for model access but applies a diff-scoped
-prompt, validates structured JSON, and filters hallucinated line numbers.
+Uses the provider selected by app.ai.providers.get_reviewer()
+(LLM_PROVIDER=gemini|groq) but applies a diff-scoped prompt, validates
+structured JSON, and filters hallucinated line numbers.
 """
 import json
 import logging
@@ -12,8 +13,6 @@ from app.ai.guardrails import fence_code
 from app.ai.providers import get_reviewer
 from app.schemas.review import Finding
 from app.github.diff import FilePatch
-
-from app.ai.reviewer import GeminiReviewer
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class DiffReviewResult:
 
 
 class DiffReviewer:
-    """Reviews one FilePatch via the Gemini model, line-validated."""
+    """Reviews one FilePatch via the configured LLM provider, line-validated."""
 
     def __init__(self, reviewer: Optional[Any] = None):
         # reviewer exposes call(prompt) -> str; defaults to the provider

@@ -5,8 +5,11 @@ Handles:
   - duplicate prevention on re-push: fetches existing review comments from
     this app (identified by a marker in the body) and skips any (file, line,
     message) triple that already exists
-  - GitHub rate limits (403 + Retry-After / X-RateLimit-Remaining) and 5xx
-    with exponential backoff retries, all logged
+  - GitHub rate limits (429, or 403 with rate-limit evidence such as
+    X-RateLimit-Remaining: 0, Retry-After, or a secondary-rate-limit
+    message) and 5xx with exponential backoff retries, all logged.
+    A plain permission 403 is permanent and fails immediately with a
+    message naming the needed GITHUB_TOKEN permission.
 """
 import logging
 import time
@@ -294,8 +297,48 @@ class ReviewPoster:
 
         raise GitHubPostingError(f"Giving up after {MAX_ATTEMPTS} attempts: {last_exc}")
 
+    @staticmethod
+    def _is_rate_limit_response(resp: requests.Response) -> bool:
+        """True only when the response is a genuine rate limit worth retrying.
+
+        429 always counts. A 403 counts only when it carries rate-limit
+        evidence: no remaining quota, a Retry-After header, or GitHub's
+        secondary-rate-limit message. A plain 403 (e.g. "Resource not
+        accessible by personal access token") is a permissions problem that
+        retries cannot fix, so it must fail immediately.
+        """
+        if resp.status_code == 429:
+            return True
+        if resp.status_code != 403:
+            return False
+        remaining = str(resp.headers.get("X-RateLimit-Remaining", "")).strip()
+        if remaining == "0":
+            return True
+        if resp.headers.get("Retry-After"):
+            return True
+        if "secondary rate limit" in (resp.text or "").lower():
+            return True
+        return False
+
+    @staticmethod
+    def _permission_error_message(resp: requests.Response) -> str:
+        """Clear, actionable message for a non-rate-limit 403."""
+        body = (resp.text or "").strip()[:200]
+        return (
+            f"GitHub denied access (HTTP 403): {body}. "
+            "This is a permission error, not a rate limit, so it was not "
+            "retried. GITHUB_TOKEN needs \"Pull requests: Read and write\" "
+            "(classic PAT with `repo` scope, or a fine-grained token / "
+            "GitHub App with Pull requests: Read and write permission)."
+        )
+
     def _retry_request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Wraps client.session with rate-limit awareness and logging."""
+        """Wraps client.session with rate-limit awareness and logging.
+
+        Retries only on 429, on 403 with rate-limit evidence, and on
+        network errors / (handled by callers) 5xx. A plain permission 403
+        raises GitHubPostingError immediately.
+        """
         sess: requests.Session = self.client.session
         headers = self.client._headers()
         timeout = 30
@@ -303,18 +346,6 @@ class ReviewPoster:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 resp = sess.request(method, url, headers=headers, timeout=timeout, **kwargs)
-                if resp.status_code == 403 or resp.status_code == 429:
-                    retry_after = resp.headers.get("Retry-After")
-                    remaining = resp.headers.get("X-RateLimit-Remaining", "?")
-                    wait = float(retry_after) if retry_after else BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                    logger.warning("GitHub rate limit hit (attempt %d/%d, remaining=%s); "
-                                   "sleeping %.1fs: %s", attempt, MAX_ATTEMPTS,
-                                   remaining, wait, url)
-                    if attempt < MAX_ATTEMPTS:
-                        time.sleep(wait)
-                        last_exc = GitHubPostingError(f"Rate limited (HTTP {resp.status_code})")
-                        continue
-                return resp
             except requests.RequestException as exc:
                 last_exc = exc
                 wait = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
@@ -322,4 +353,30 @@ class ReviewPoster:
                                method, url, attempt, MAX_ATTEMPTS, wait, exc)
                 if attempt < MAX_ATTEMPTS:
                     time.sleep(wait)
+                continue
+
+            if self._is_rate_limit_response(resp):
+                retry_after = resp.headers.get("Retry-After")
+                remaining = resp.headers.get("X-RateLimit-Remaining", "?")
+                wait = float(retry_after) if retry_after else BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning("GitHub rate limit hit (attempt %d/%d, remaining=%s); "
+                               "sleeping %.1fs: %s", attempt, MAX_ATTEMPTS,
+                               remaining, wait, url)
+                last_exc = GitHubPostingError(f"Rate limited (HTTP {resp.status_code})")
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(wait)
+                    continue
+                raise GitHubPostingError(
+                    f"Rate limited by GitHub (HTTP {resp.status_code}) after "
+                    f"{MAX_ATTEMPTS} attempts (remaining={remaining}, "
+                    f"Retry-After={retry_after!r}): {url}"
+                )
+
+            if resp.status_code == 403:
+                # Plain permission error: permanent, retrying cannot help.
+                msg = self._permission_error_message(resp)
+                logger.error("%s (%s %s)", msg, method, url)
+                raise GitHubPostingError(msg)
+
+            return resp
         raise GitHubPostingError(f"Request failed after {MAX_ATTEMPTS} attempts: {last_exc}")

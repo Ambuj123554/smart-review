@@ -1,5 +1,6 @@
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.analyzer.engine import ASTAnalyzer
 from app.github.webhooks import router as github_webhook_router
-from app.ai.providers import get_reviewer
+from app.ai.providers import active_model, active_provider, get_reviewer
 from app.ai.reviewer import build_review_prompt, parse_findings_response
 from app.database.db import DatabaseManager
 from app.schemas.review import (
@@ -21,11 +22,30 @@ from app.schemas.review import (
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Logs the active LLM provider/model at startup (never keys).
+
+    Makes a misconfigured LLM_PROVIDER visible in the logs immediately
+    instead of surfacing later as a surprising call to the wrong vendor.
+    """
+    provider = active_provider()
+    model = active_model()
+    logger.info(
+        "Active LLM provider: %s (model: %s). Set via LLM_PROVIDER.",
+        provider,
+        model,
+    )
+    yield
+
+
 # Initialize FastAPI application
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="AI-Powered Code Review Engine using FastAPI, AST analysis, and the configured LLM provider (Gemini or Groq)."
+    description="AI-Powered Code Review Engine using FastAPI, AST analysis, and the configured LLM provider (Gemini or Groq).",
+    lifespan=lifespan,
 )
 
 def _cors_settings(origins_raw: str) -> dict:

@@ -248,3 +248,73 @@ def test_summary_body_contains_severity_counts(poster, client):
     poster.post_review("o/r", 1, "sha", findings)
     sent = client.session.request.call_args.kwargs["json"]
     assert "2" in sent["body"] and "CRITICAL" in sent["body"].upper()
+
+
+# --------------------- 403 handling: permission vs rate limit --------------
+
+def _plain_403():
+    """A permission 403 with plenty of quota left (X-RateLimit-Remaining ~5000).
+
+    Real example from a webhook run: "Resource not accessible by personal
+    access token" with remaining=5000 was retried 4x with backoff as if it
+    were a rate limit.
+    """
+    return _resp(
+        403,
+        {"message": "Resource not accessible by personal access token"},
+        headers={"X-RateLimit-Remaining": "5000", "X-RateLimit-Limit": "5000"},
+    )
+
+
+def test_plain_403_fails_immediately_no_retry(poster, client, monkeypatch):
+    """Permission 403 (quota left, no Retry-After) must fail on the spot
+    with a message naming the needed GITHUB_TOKEN permission."""
+    sleeps = []
+    monkeypatch.setattr("app.github.comments.time.sleep", sleeps.append)
+    client.session.request.side_effect = [
+        _resp(200, []),   # existing comments GET
+        _plain_403(),     # review POST -> permission denied
+    ]
+    with pytest.raises(GitHubPostingError, match="Pull requests: Read and write"):
+        poster.post_review("o/r", 1, "sha", [_finding()])
+    # Exactly one GET + one POST; no retry, no backoff sleeps.
+    assert client.session.request.call_count == 2
+    assert sleeps == []
+
+
+def test_plain_403_message_mentions_permission_not_rate_limit(poster, client):
+    client.session.request.side_effect = [_resp(200, []), _plain_403()]
+    with pytest.raises(GitHubPostingError) as excinfo:
+        poster.post_review("o/r", 1, "sha", [_finding()])
+    msg = str(excinfo.value)
+    assert "permission error, not a rate limit" in msg
+    assert "Resource not accessible" in msg
+    assert "GITHUB_TOKEN" in msg
+
+
+def test_403_with_zero_rate_limit_remaining_is_retried(client, monkeypatch):
+    """403 + X-RateLimit-Remaining: 0 IS a rate limit: retry, then succeed."""
+    monkeypatch.setattr("app.github.comments.time.sleep", lambda s: None)
+    poster = ReviewPoster(client=client)
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(403, {"message": "API rate limit exceeded"},
+              headers={"X-RateLimit-Remaining": "0"}),
+        _resp(201, {"id": 7}),
+    ]
+    assert poster.post_review("o/r", 1, "sha", [_finding()]) == {"id": 7}
+    assert client.session.request.call_count == 3
+
+
+def test_403_with_secondary_rate_limit_message_is_retried(client, monkeypatch):
+    """403 carrying GitHub's secondary-rate-limit message: retry, then succeed."""
+    monkeypatch.setattr("app.github.comments.time.sleep", lambda s: None)
+    poster = ReviewPoster(client=client)
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(403, {"message": "You have exceeded a secondary rate limit. "
+                               "Please wait a few minutes before you try again."}),
+        _resp(201, {"id": 8}),
+    ]
+    assert poster.post_review("o/r", 1, "sha", [_finding()]) == {"id": 8}
+    assert client.session.request.call_count == 3

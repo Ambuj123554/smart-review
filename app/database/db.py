@@ -85,9 +85,12 @@ class DatabaseManager:
         """Persists one PR review and its findings.
 
         `findings` is a list of dicts with keys:
-        file_path, line, severity, category, message, and optionally
-        suggestion, explanation (kept NULL when absent).
-        Returns the pr_reviews row id.
+        path (file_path is accepted as a legacy alias), line, severity,
+        category, message, and optionally suggestion, explanation
+        (kept NULL when absent). Returns the pr_reviews row id.
+
+        Raises KeyError when a finding carries neither path nor file_path
+        so a schema drift is loud instead of a silent data-loss bug.
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -128,6 +131,15 @@ class DatabaseManager:
                 return pr_review_id  # nothing to insert after all
 
             for f in findings:
+                # The webhook pipeline (and comment posting) keys findings
+                # by "path"; older callers used "file_path". Accept both so
+                # the two never drift into a KeyError again.
+                path = f.get("path") or f.get("file_path")
+                if not path:
+                    raise KeyError(
+                        "finding is missing 'path' key (legacy 'file_path' "
+                        f"also accepted): {sorted(f)}"
+                    )
                 cursor.execute(
                     """
                     INSERT INTO pr_findings
@@ -137,7 +149,7 @@ class DatabaseManager:
                     """,
                     (
                         pr_review_id,
-                        f["file_path"],
+                        path,
                         f["line"],
                         f["severity"],
                         f["category"],
