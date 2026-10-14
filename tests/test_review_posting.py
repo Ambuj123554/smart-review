@@ -2,7 +2,12 @@ import pytest
 
 from unittest.mock import MagicMock
 
-from app.github.comments import ReviewPoster, BOT_MARKER, GitHubPostingError
+from app.github.comments import (
+    ReviewPoster,
+    BOT_MARKER,
+    LINE_HASH_RE,
+    GitHubPostingError,
+)
 
 
 def _resp(status=200, json_data=None, headers=None):
@@ -15,10 +20,12 @@ def _resp(status=200, json_data=None, headers=None):
 
 
 def _finding(path="a.py", line=1, message="problem", severity="HIGH",
-             category="Security", suggestion=None, explanation=""):
+             category="Security", suggestion=None, explanation="",
+             line_text=None):
     return {"path": path, "line": line, "message": message,
             "severity": severity, "category": category,
-            "suggestion": suggestion, "explanation": explanation}
+            "suggestion": suggestion, "explanation": explanation,
+            "line_text": line_text}
 
 
 @pytest.fixture
@@ -148,9 +155,10 @@ def test_gives_up_after_max_attempts_on_persistent_5xx(poster, client):
         poster.post_review("o/r", 1, "sha", [_finding()])
 
 
-def test_dedupe_keys_on_message_not_explanation_or_suggestion(poster, client):
-    """Spec: dedupe on file + line + MESSAGE. Suggestion/explanation may vary
-    between model runs and must not cause a re-post."""
+def test_dedupe_ignores_message_suggestion_and_explanation(poster, client):
+    """Dedupe on file + line + category/severity tag, never on the message:
+    suggestion/explanation/message may all vary between model runs and must
+    not cause a re-post."""
     existing = _existing(BOT_MARKER + "\n**[HIGH] Security:** problem")
     client.session.request.side_effect = [
         _resp(200, [existing]),
@@ -318,3 +326,140 @@ def test_403_with_secondary_rate_limit_message_is_retried(client, monkeypatch):
     ]
     assert poster.post_review("o/r", 1, "sha", [_finding()]) == {"id": 8}
     assert client.session.request.call_count == 3
+
+
+# -------- regression: duplicate inline comments on re-runs of a PR ---------
+#
+# Found in a real PR run: a redelivered webhook / new push re-reviewed the
+# same lines and the bot posted the same issue again with reworded LLM text
+# (e.g. "Potential division by zero" and "Potential division by zero and
+# undefined result if exception occurs" both on line 4).
+
+def _posted_inline_comments(client):
+    """Builds GET /pulls/{n}/comments entries from the last review POST."""
+    payload = client.session.request.call_args.kwargs["json"]
+    return [{"path": c["path"], "line": c["line"], "body": c["body"]}
+            for c in payload["comments"]]
+
+
+def _division_finding(message="Potential division by zero", severity="HIGH",
+                      line_text="result = total / count"):
+    return _finding(line=4, message=message, severity=severity,
+                    category="Bug Risk", line_text=line_text)
+
+
+def test_rerun_on_same_commit_posts_no_duplicate(poster, client):
+    """Webhook redelivery / re-review of the SAME commit: nothing new to
+    say, so no second review may be posted."""
+    finding = _division_finding()
+
+    # First run: PR has no bot comments yet -> the finding is posted.
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    assert poster.post_review("o/r", 42, "sha1", [finding]) == {"id": 1}
+    posted = _posted_inline_comments(client)
+    assert len(posted) == 1
+
+    # Second run, same commit, same finding -> deduped, review not re-posted.
+    client.session.request.side_effect = [_resp(200, posted), _resp(201, {})]
+    assert poster.post_review("o/r", 42, "sha1", [finding]) is None
+    # 2 calls from run 1 + GET-only from run 2: no second review POST.
+    assert client.session.request.call_count == 3
+    assert client.session.request.call_args.args[0] == "GET"
+
+
+def test_rerun_with_different_ai_wording_is_not_duplicated(poster, client):
+    """Regression for the real bug: the same issue re-reported by the LLM
+    with different wording (and even a different severity) on the same
+    file+line+category is the SAME issue -> no new comment."""
+    first = _division_finding(message="Potential division by zero",
+                              severity="MEDIUM")
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    poster.post_review("o/r", 42, "sha1", [first])
+    posted = _posted_inline_comments(client)
+
+    reworded = _division_finding(
+        message="Potential division by zero and undefined result "
+                "if exception occurs",
+        severity="HIGH",
+    )
+    client.session.request.side_effect = [_resp(200, posted), _resp(201, {})]
+    assert poster.post_review("o/r", 42, "sha1", [reworded]) is None
+    assert client.session.request.call_args.args[0] == "GET"  # no POST
+
+
+def test_rerun_different_category_and_severity_on_same_line_posts(poster, client):
+    """A genuinely different issue on an already-commented line (neither
+    the category nor the severity tag matches) is NOT a duplicate."""
+    existing = _existing(
+        BOT_MARKER + "\n**[HIGH] Bug Risk:** Potential division by zero")
+    client.session.request.side_effect = [
+        _resp(200, [existing]),
+        _resp(201, {"id": 2}),
+    ]
+    poster.post_review("o/r", 42, "sha",
+                       [_finding(line=1, severity="LOW", category="Style",
+                                 message="rename this variable")])
+    sent = client.session.request.call_args.kwargs["json"]
+    assert len(sent["comments"]) == 1
+
+
+def test_new_push_that_changes_the_line_is_reviewed_again(poster, client):
+    """A new commit that EDITS the commented line must get a fresh comment
+    even though file/line/category/severity are unchanged."""
+    first = _division_finding(line_text="result = total / count")
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    poster.post_review("o/r", 42, "sha1", [first])
+    posted = _posted_inline_comments(client)
+
+    edited = _division_finding(line_text="result = total / divisor")
+    client.session.request.side_effect = [_resp(200, posted), _resp(201, {"id": 2})]
+    result = poster.post_review("o/r", 42, "sha2", [edited])
+    assert result == {"id": 2}
+    sent = client.session.request.call_args.kwargs["json"]
+    assert sent["commit_id"] == "sha2"
+    assert len(sent["comments"]) == 1
+
+
+def test_existing_bot_comment_without_line_hash_still_dedupes(poster, client):
+    """Comments posted before the line-hash marker existed must still be
+    recognized as duplicates (missing hash == content treated as unchanged)."""
+    existing = _existing(BOT_MARKER + "\n**[HIGH] Bug Risk:** old wording",
+                         line=4)
+    client.session.request.side_effect = [
+        _resp(200, [existing]),
+        _resp(201, {"id": 9}),
+    ]
+    assert poster.post_review(
+        "o/r", 42, "sha", [_division_finding(message="new wording")]
+    ) is None
+
+
+def test_same_line_same_category_findings_merge_keeping_most_severe(poster, client):
+    """Within a single run, two AI findings on the same line about the same
+    category collapse into ONE comment keeping the most severe wording."""
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    findings = [
+        _division_finding(message="Potential division by zero",
+                          severity="MEDIUM"),
+        _division_finding(
+            message="Potential division by zero and undefined result "
+                    "if exception occurs",
+            severity="HIGH",
+        ),
+    ]
+    poster.post_review("o/r", 42, "sha", findings)
+    sent = client.session.request.call_args.kwargs["json"]
+    assert len(sent["comments"]) == 1
+    assert "undefined result" in sent["comments"][0]["body"]
+
+
+def test_comment_body_embeds_line_hash_only_when_line_text_known(poster, client):
+    client.session.request.return_value = _resp(201, {"id": 1})
+    poster.post_review("o/r", 1, "sha", [_division_finding()])
+    body = client.session.request.call_args.kwargs["json"]["comments"][0]["body"]
+    assert LINE_HASH_RE.search(body) is not None
+
+    client.session.request.return_value = _resp(201, {"id": 2})
+    poster.post_review("o/r", 1, "sha", [_finding()])  # no line_text
+    body = client.session.request.call_args.kwargs["json"]["comments"][0]["body"]
+    assert LINE_HASH_RE.search(body) is None

@@ -12,7 +12,11 @@ from app.analyzer.engine import ASTAnalyzer
 from app.config import settings
 from app.database.db import DatabaseManager
 from app.github.client import GitHubApiClient, GitHubApiError
-from app.github.comments import ReviewPoster, GitHubPostingError
+from app.github.comments import (
+    ReviewPoster,
+    GitHubPostingError,
+    severity_rank,
+)
 from app.github.diff import FilePatch, parse_files_payload
 
 logger = logging.getLogger(__name__)
@@ -94,7 +98,10 @@ def _ast_findings_for_file(
     content = client.get_file_content(repo_full_name, file_patch.path, head_sha)
     if not content:
         return []
-    valid_lines = {al.line for al in file_patch.added_lines}
+    # Line -> text of the added line, so findings carry the commented line's
+    # content (used by the poster to detect that a line changed on re-push).
+    added_by_line = {al.line: al.content for al in file_patch.added_lines}
+    valid_lines = set(added_by_line)
     out: List[dict] = []
     for f in analyzer.analyze(content):
         if f.line not in valid_lines:
@@ -107,25 +114,33 @@ def _ast_findings_for_file(
             "explanation": f.explanation,
             "severity": f.severity,
             "category": f.category,
+            "line_text": added_by_line.get(f.line),
         })
     return out
 
 
 def _merge_findings(
-    path: str, ast_findings: List[dict], llm_result: DiffReviewResult
+    path: str,
+    ast_findings: List[dict],
+    llm_result: DiffReviewResult,
+    line_texts: Optional[dict] = None,
 ) -> List[dict]:
     """Merges AST + LLM findings for one file, deduplicated per line.
 
     AST results are deterministic, so they win on (path, line) collisions;
-    the LLM's finding for an already-covered line is dropped instead.
+    LLM findings on an AST-covered line are dropped. Among LLM findings on
+    the same line, findings about the same category are merged into one,
+    keeping the most severe (LLM wording varies between runs). Each finding
+    carries `line_text` (when known) so the comment poster can tell whether
+    the line's content changed since a previous run's comment.
     """
     merged: List[dict] = list(ast_findings)
-    covered = {(d["path"], d["line"]) for d in merged}
+    ast_lines = {(d["path"], d["line"]) for d in merged}
+    kept: dict = {}  # (path, line, category) -> index into `merged`
     for f in llm_result.findings:
-        key = (path, f.line)
-        if key in covered:
-            continue
-        merged.append({
+        if (path, f.line) in ast_lines:
+            continue  # AST already covers this line deterministically
+        entry = {
             "path": path,
             "line": f.line,
             "message": f.message,
@@ -133,8 +148,15 @@ def _merge_findings(
             "explanation": f.explanation,
             "severity": f.severity,
             "category": f.category,
-        })
-        covered.add(key)
+            "line_text": (line_texts or {}).get(f.line),
+        }
+        group = (path, f.line, f.category)
+        pos = kept.get(group)
+        if pos is None:
+            kept[group] = len(merged)
+            merged.append(entry)
+        elif severity_rank(f.severity) > severity_rank(merged[pos]["severity"]):
+            merged[pos] = entry  # same issue re-reported more severely
     return merged
 
 
@@ -213,7 +235,12 @@ def _process_review(
                            fp.path, repo_full_name, pr_number, err)
             ast_findings = []
         results.append(llm_result)
-        findings_payload.extend(_merge_findings(fp.path, ast_findings, llm_result))
+        findings_payload.extend(_merge_findings(
+            fp.path,
+            ast_findings,
+            llm_result,
+            line_texts={al.line: al.content for al in fp.added_lines},
+        ))
 
     logger.info(
         "Review complete for %s#%s: %d file(s), %d merged finding(s).",
@@ -224,7 +251,8 @@ def _process_review(
     )
 
     # Post ONE consolidated review with inline comments; duplicates from
-    # previous pushes (same path/line/body) are skipped internally.
+    # previous pushes/webhook deliveries (same path/line/category-or-
+    # severity, unchanged line content) are skipped internally.
     try:
         ReviewPoster().post_review(
             repo_full_name, pr_number, head_sha, findings_payload,

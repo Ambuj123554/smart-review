@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 
 import pytest
 import requests
@@ -182,6 +183,20 @@ def test_webhook_pipeline_findings_reach_db_and_stats(pipeline_env):
     assert stats["by_repo"] == {"octocat/hello-world": 1}
     assert stats["by_severity"] == {"HIGH": 1}
     assert stats["by_category"] == {"Security": 1}
+
+
+def test_webhook_pipeline_embeds_line_hash_for_repost_detection(pipeline_env):
+    """Regression for duplicate inline comments on re-runs: the posted
+    comment must carry the invisible line-hash marker so a later run can
+    tell whether the commented line's content changed."""
+    with TestClient(main_module.app) as client:
+        assert _post_pr_webhook(client).status_code == 200
+
+    review_posts = [kw for _, url, kw in pipeline_env["http_calls"]
+                    if url.endswith("/pulls/42/reviews")]
+    assert review_posts, "pipeline never posted the inline review"
+    body = review_posts[0]["json"]["comments"][0]["body"]
+    assert re.search(r"<!--\s*line-hash:[0-9a-f]{16}\s*-->", body), body
 
 
 def test_startup_logs_active_provider_and_model(pipeline_env, caplog):

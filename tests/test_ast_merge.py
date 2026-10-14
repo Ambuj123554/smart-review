@@ -93,6 +93,53 @@ def test_merge_dedupes_within_llm_duplicate_lines():
     assert merged[0]["message"] == "first"
 
 
+def test_merge_keeps_most_severe_llm_finding_on_same_line_and_category():
+    """Regression: the LLM re-reports the same issue on the same line with
+    different wording/severity; the merged run must keep the MOST SEVERE
+    one, not whichever came first."""
+    mild = Finding(rule_id="AI-DIFF-001", category="Bug Risk", severity="MEDIUM",
+                   line=4, message="Potential division by zero",
+                   explanation="", suggestion="")
+    severe = Finding(
+        rule_id="AI-DIFF-001", category="Bug Risk", severity="HIGH", line=4,
+        message="Potential division by zero and undefined result if exception occurs",
+        explanation="", suggestion="",
+    )
+    for llm in (_llm_result(mild, severe), _llm_result(severe, mild)):
+        merged = _merge_findings("f.py", [], llm)
+        assert len(merged) == 1
+        assert merged[0]["severity"] == "HIGH"
+        assert "undefined result" in merged[0]["message"]
+
+
+def test_merge_keeps_llm_findings_of_different_categories_on_same_line():
+    """Different categories on the same line are different issues: both
+    survive the merge (the poster dedupes cross-run, not within a run)."""
+    a = Finding(rule_id="AI-DIFF-001", category="Bug Risk", severity="MEDIUM",
+                line=4, message="division by zero", explanation="", suggestion="")
+    b = Finding(rule_id="AI-DIFF-002", category="Style", severity="LOW",
+                line=4, message="unclear name", explanation="", suggestion="")
+    merged = _merge_findings("f.py", [], _llm_result(a, b))
+    assert [(d["line"], d["category"]) for d in merged] == [
+        (4, "Bug Risk"), (4, "Style")]
+
+
+def test_merge_llm_findings_carry_line_text_when_provided():
+    merged = _merge_findings("f.py", [], _llm_result(_llm_finding(3)),
+                             line_texts={3: "x = 1"})
+    assert merged[0]["line_text"] == "x = 1"
+
+
+def test_ast_findings_carry_line_text():
+    """AST findings carry the commented line's content so the poster can
+    detect that a line changed since a previous run's comment."""
+    client = _client_with_source(SOURCE)
+    fp = FilePatch(path="f.py",
+                   added_lines=[AddedLine(line=2, content='    eval("1")')])
+    out = _ast_findings_for_file(client, "o/r", "sha", fp, ASTAnalyzer())
+    assert out[0]["line_text"] == '    eval("1")'
+
+
 # ------------------- Task 1: extension skip + truncation -------------------
 
 def test_non_code_extension_skips_content_fetch():

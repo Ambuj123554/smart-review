@@ -2,18 +2,28 @@
 
 Handles:
   - inline comment payloads (path, line, side="RIGHT", commit_id=head SHA)
-  - duplicate prevention on re-push: fetches existing review comments from
-    this app (identified by a marker in the body) and skips any (file, line,
-    message) triple that already exists
+  - duplicate prevention on re-push / webhook redelivery: fetches existing
+    review comments from this app (identified by a marker in the body) via
+    GET /repos/{o}/{r}/pulls/{n}/comments and skips any new finding whose
+    (file, line, category-or-severity) already has a comment, regardless of
+    the exact message text — LLM wording changes between runs, so keying on
+    the message used to double-post the same issue.
+  - re-review when the line changed: each posted comment embeds a hash of
+    the commented line's content; a finding on a line whose content has
+    changed since is NOT treated as a duplicate, even under a new commit SHA.
+  - within-run merging: findings on the same file+line+category collapse
+    into ONE comment keeping the most severe one.
   - GitHub rate limits (429, or 403 with rate-limit evidence such as
     X-RateLimit-Remaining: 0, Retry-After, or a secondary-rate-limit
     message) and 5xx with exponential backoff retries, all logged.
     A plain permission 403 is permanent and fails immediately with a
     message naming the needed GITHUB_TOKEN permission.
 """
+import hashlib
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -24,8 +34,35 @@ logger = logging.getLogger(__name__)
 # Marker so we can recognize our own comments among human ones.
 BOT_MARKER = "<!-- smart-review-assistant -->"
 
+# Invisible marker embedded in posted bodies recording the hash of the
+# commented line's content, so a later run can tell whether the line was
+# edited since (edited line -> re-review, unchanged -> duplicate).
+LINE_HASH_RE = re.compile(r"<!--\s*line-hash:([0-9a-f]+)\s*-->")
+
+# Parses the '**[SEV] Cat:**' prefix of a bot comment body.
+TAGS_RE = re.compile(r"\*\*\[([A-Za-z]+)\]\s*([^:*]+?):\*\*")
+
+# Short hash keeps the invisible marker small; 64 bits of sha256 suffices.
+LINE_HASH_LEN = 16
+
 # Severity order used for the overall-risk rollup (highest wins).
 RISK_ORDER = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+
+
+def severity_rank(value: Any) -> int:
+    """Sort key for severities (higher = more severe); unknown -> lowest."""
+    sev = str(value or "INFO").upper()
+    try:
+        return -RISK_ORDER.index(sev)
+    except ValueError:
+        return len(RISK_ORDER)
+
+
+def line_hash(text: Optional[str]) -> Optional[str]:
+    """Content hash embedded in comment bodies; None when text unknown."""
+    if text is None:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:LINE_HASH_LEN]
 
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 2.0
@@ -63,8 +100,11 @@ class ReviewPoster:
         """Posts findings as inline comments in one review.
 
         Each finding dict needs: path, line, message, and optionally
-        suggestion, severity, category. Findings are deduplicated against
-        existing comments first (sync pushes produce the same lines again).
+        suggestion, severity, category, line_text (the content of the
+        commented line — used to detect that a line was edited since a
+        previous run). Findings are deduplicated against existing comments
+        first (sync pushes and redelivered webhooks produce the same lines
+        again, possibly with reworded LLM messages).
         When `files_analysed` is given, one PR-level summary comment
         (files, severity/category counts, overall risk) is posted after a
         successful inline review; it is never posted when there are no
@@ -77,26 +117,20 @@ class ReviewPoster:
                         repo_full_name, pr_number)
             return None
 
+        # Within a single run: the model may report the same issue twice on
+        # the same line with different wording — collapse same file+line+
+        # category into one comment, keeping the most severe.
+        findings = self._merge_same_line(findings)
+
         existing = self._existing_bot_comments(repo_full_name, pr_number)
-        # Key existing comments on (path, line, message) too — the message is
-        # embedded in the bot body after the '**[SEV] Cat:**' prefix, so the
-        # key builder re-derives it from the stored body.
-        existing_keys = {
-            self._dedupe_key(
-                {"path": c.get("path"), "line": c.get("line"),
-                 "message": self._message_from_body(c.get("body", ""))},
-                c.get("body", ""),
-            )
-            for c in existing
-        }
 
         comments: List[Dict[str, Any]] = []
         skipped_dupes = 0
         for f in findings:
-            body = self._comment_body(f)
-            if self._dedupe_key(f, body) in existing_keys:
+            if self._is_duplicate(f, existing):
                 skipped_dupes += 1
                 continue
+            body = self._comment_body(f)
             comments.append({
                 "path": f["path"],
                 "line": f["line"],       # new-side line number
@@ -136,41 +170,91 @@ class ReviewPoster:
 
     # --------------------------- internals --------------------------------
 
+    @staticmethod
+    def _merge_same_line(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merges findings on the same file+line+category into ONE finding.
+
+        Keeps the most severe one (CRITICAL > HIGH > MEDIUM > LOW > INFO)
+        so a run that reports the same issue twice with different wording
+        still yields a single inline comment. First occurrence's position
+        wins; the caller's list is not mutated.
+        """
+        merged: List[Dict[str, Any]] = []
+        index: Dict[tuple, int] = {}
+        for f in findings:
+            key = (f.get("path"), f.get("line"),
+                   str(f.get("category") or "Code Quality"))
+            pos = index.get(key)
+            if pos is None:
+                index[key] = len(merged)
+                merged.append(f)
+            elif severity_rank(f.get("severity")) > severity_rank(merged[pos].get("severity")):
+                merged[pos] = f
+        return merged
+
+    def _is_duplicate(
+        self,
+        finding: Dict[str, Any],
+        existing: List[Dict[str, Any]],
+    ) -> bool:
+        """True when a bot comment already covers this finding.
+
+        Same file + same line + same category-or-severity tag counts as the
+        same issue even when the LLM reworded the message. The commit SHA is
+        deliberately NOT part of the identity: a redelivered webhook or a new
+        push re-reports unchanged lines. Exception: when the line's content
+        changed since the old comment was posted (embedded line-hash
+        mismatch), the finding is new and must be posted again.
+        """
+        new_sev = str(finding.get("severity", "INFO")).upper()
+        new_cat = str(finding.get("category") or "Code Quality")
+        new_hash = line_hash(finding.get("line_text"))
+        for c in existing:
+            if (c.get("path") != finding.get("path")
+                    or c.get("line") != finding.get("line")):
+                continue
+            body = c.get("body", "")
+            old_hash = self._line_hash_from_body(body)
+            # Line edited since the old comment: re-review, not a duplicate.
+            if old_hash and new_hash and old_hash != new_hash:
+                continue
+            old_sev, old_cat = self._tags_from_body(body)
+            if (old_cat and old_cat == new_cat) \
+                    or (old_sev and old_sev == new_sev):
+                return True
+        return False
+
+    @staticmethod
+    def _tags_from_body(body: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extracts (severity, category) from a bot body's '**[SEV] Cat:**'
+        prefix; (None, None) when the shape doesn't match."""
+        match = TAGS_RE.search(body or "")
+        if not match:
+            return None, None
+        return match.group(1).upper(), match.group(2).strip()
+
+    @staticmethod
+    def _line_hash_from_body(body: str) -> Optional[str]:
+        """Extracts the embedded line-content hash from a bot body."""
+        match = LINE_HASH_RE.search(body or "")
+        return match.group(1) if match else None
+
     def _comment_body(self, finding: Dict[str, Any]) -> str:
-        parts = [BOT_MARKER, f"**[{finding.get('severity', 'INFO')}] "
-                             f"{finding.get('category', 'Code Quality')}:** "
-                             f"{finding['message']}"]
+        parts = [BOT_MARKER]
+        body_hash = line_hash(finding.get("line_text"))
+        if body_hash:
+            # Invisible marker: lets a later run detect that the commented
+            # line's text changed (then the finding is not a duplicate).
+            parts.append(f"<!-- line-hash:{body_hash} -->")
+        parts.append(f"**[{finding.get('severity', 'INFO')}] "
+                     f"{finding.get('category', 'Code Quality')}:** "
+                     f"{finding['message']}")
         suggestion = finding.get("suggestion", "")
         if suggestion:
             parts.append(f"\n```suggestion\n{suggestion}\n```")
         if finding.get("explanation"):
             parts.append(f"\n{finding['explanation']}")
         return "\n".join(parts)
-
-    def _message_from_body(self, body: str) -> str:
-        """Extracts the message part from a bot comment body.
-
-        Bot bodies look like:
-            <!-- smart-review-assistant -->\n**[SEV] Cat:** message...
-        Returns the text after the '** Cat:** ' segment (i.e. the '** '
-        closing bold, then ':** '), or the whole stripped body as a
-        defensive fallback when the shape doesn't match.
-        """
-        marker = ":** "
-        idx = body.find(marker)
-        if idx == -1:
-            return body.strip()
-        tail = body[idx + len(marker):]
-        return tail.split("\n", 1)[0].strip()
-
-    def _dedupe_key(self, finding: Dict[str, Any], body: str) -> tuple:
-        """Identity of a finding for duplicate detection.
-
-        Spec says file + line + message; the other body parts (suggestion,
-        explanation) may legitimately vary between re-runs of the model, so
-        they must NOT be part of the key or legit re-pushes would double-post.
-        """
-        return (finding["path"], finding["line"], finding["message"])
 
     def _summary_body(self, findings: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> str:
         counts: Dict[str, int] = {}
