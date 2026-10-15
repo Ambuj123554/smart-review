@@ -25,7 +25,13 @@ class Settings:
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
     # Guard rails for very large PRs (0 = no cap)
     MAX_FILES_PER_PR: int = int(os.getenv("MAX_FILES_PER_PR", "20"))
+    MAX_LINES_PER_FILE: int = int(os.getenv("MAX_LINES_PER_FILE", "800"))
     GITHUB_MAX_LINES: int = int(os.getenv("GITHUB_MAX_LINES", "3000"))
+
+    # Lowest severity posted as an inline PR comment (LOW|MEDIUM|HIGH|
+    # CRITICAL). Lower findings are still saved to the DB and counted in
+    # the PR summary. Validated at startup; invalid values fall back to LOW.
+    MIN_SEVERITY: str = os.getenv("MIN_SEVERITY", "LOW")
     
     # Database configuration
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", "reviews.db")

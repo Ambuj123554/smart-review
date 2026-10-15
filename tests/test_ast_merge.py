@@ -185,7 +185,9 @@ def _hermetic_pipeline(monkeypatch, files):
     monkeypatch.setattr(wh, "GitHubApiClient", lambda: fake_client)
     monkeypatch.setattr(
         wh, "DiffReviewer",
-        lambda: MagicMock(review_file=lambda fp: wh.DiffReviewResult(fp.path)),
+        # **kwargs: the pipeline passes the repo config's custom_instructions.
+        lambda **kwargs: MagicMock(
+            review_file=lambda fp: wh.DiffReviewResult(fp.path)),
     )
     monkeypatch.setattr(wh, "ReviewPoster", MagicMock)
     monkeypatch.setattr(wh, "DatabaseManager", MagicMock)

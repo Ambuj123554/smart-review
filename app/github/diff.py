@@ -90,7 +90,8 @@ def parse_patch(
     return result
 
 
-def parse_files_payload(files: List[dict], max_files: int = 0, max_lines: int = 0) -> List[FilePatch]:
+def parse_files_payload(files: List[dict], max_files: int = 0, max_lines: int = 0,
+                        max_lines_per_file: int = 0) -> List[FilePatch]:
     """Parses the JSON array from GET /repos/{o}/{r}/pulls/{n}/files.
 
     Skips:
@@ -99,8 +100,10 @@ def parse_files_payload(files: List[dict], max_files: int = 0, max_lines: int = 
       - deleted files (`status == "removed"`; nothing to review),
       - files with no patch (e.g. mode-only changes).
 
-    Caps the total number of files (max_files, 0 = no cap) and the total
-    number of added lines across files (max_lines, 0 = no cap).
+    Caps the total number of files (max_files, 0 = no cap), the total
+    number of added lines across files (max_lines, 0 = no cap), and the
+    added lines kept per file (max_lines_per_file, 0 = no cap). Files cut
+    by a line cap stay in the result up to the cap with `truncated` set.
     """
     parsed: List[FilePatch] = []
     total_lines_used = 0
@@ -136,7 +139,14 @@ def parse_files_payload(files: List[dict], max_files: int = 0, max_lines: int = 
         # "capped to exactly this many" (remaining > 0 under a global cap):
         # pass a sentinel so truncated still reflects a real truncation.
 
-        fp = parse_patch(path, patch_text, old_path=old_path, max_lines=remaining)
+        # Per-file cap (0 = unlimited); never exceed the remaining global
+        # budget when one is active (remaining == 0 means "no global cap").
+        per_file = remaining
+        if max_lines_per_file > 0:
+            per_file = (max_lines_per_file if remaining == 0
+                        else min(max_lines_per_file, remaining))
+
+        fp = parse_patch(path, patch_text, old_path=old_path, max_lines=per_file)
 
         # Keep the file even when truncated: its lines are valid up to the cap.
         if fp.added_lines:

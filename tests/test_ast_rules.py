@@ -1,10 +1,70 @@
 import pytest
 from app.analyzer.engine import ASTAnalyzer
+from app.analyzer.rules.missing_tests import MissingTestsRule, is_test_file
 
 
 @pytest.fixture
 def analyzer():
     return ASTAnalyzer()
+
+
+# ------------------- missing-tests rule (PR-level, TEST-001) ---------------
+
+CODE = (
+    "class Validator:\n"        # line 1
+    "    def check(self, x):\n"  # line 2
+    "        return x is not None\n"  # line 3
+    "\n"                          # line 4
+    "def parse(text):\n"          # line 5
+    "    return text.strip()\n"   # line 6
+)
+
+
+def test_missing_tests_rule_picks_first_changed_definition():
+    rule = MissingTestsRule()
+    # Changed lines 5-6 only -> the function, not the class above.
+    assert rule.first_definition(CODE, {5, 6}) == ("function", "parse", 5)
+    # Changed lines 1-3 -> the class block; the class itself comes first.
+    assert rule.first_definition(CODE, {1, 2, 3}) == ("class", "Validator", 1)
+    # Only the method's def line changed -> the method.
+    assert rule.first_definition(CODE, {2}) == ("function", "check", 2)
+    # A body-only edit (line 3) is not "changing the function".
+    assert rule.first_definition(CODE, {3}) is None
+
+
+def test_missing_tests_rule_ignores_no_definition_and_bad_syntax():
+    rule = MissingTestsRule()
+    assert rule.first_definition("x = 1\ny = 2\n", {1, 2}) is None
+    assert rule.first_definition("def broken(:", {1}) is None  # SyntaxError
+    assert rule.first_definition("", {1}) is None
+
+
+def test_missing_tests_finding_shape():
+    rule = MissingTestsRule()
+    d = rule.finding_dict("app.py", "function", "parse", 5,
+                          "def parse(text):")
+    assert d["category"] == "Testing"
+    assert d["severity"] in ("LOW", "MEDIUM")
+    assert (d["path"], d["line"]) == ("app.py", 5)
+    assert d["line_text"] == "def parse(text):"
+    assert "parse" in d["message"] and "test" in d["message"].lower()
+    assert "test" in d["suggestion"].lower()
+
+
+def test_is_test_file_patterns():
+    for p in ("test_app.py", "tests/test_app.py", "app_test.py",
+              "pkg/app_test.py", "test/utils.py", "tests/helpers/util.py",
+              "src/tests/integration.py"):
+        assert is_test_file(p), p
+    for p in ("app.py", "contest.py", "latest.py", "src/testing_helper.py",
+              "testcase.py", "docs/contributing.md"):
+        assert not is_test_file(p), p
+
+
+def test_missing_tests_rule_not_in_per_file_engine(analyzer):
+    """PR-level rule: the per-file engine must not fire it on every file."""
+    from app.analyzer.rules.missing_tests import MissingTestsRule as M
+    assert M not in analyzer.rule_classes
 
 
 def test_rule_1_mutable_default(analyzer):

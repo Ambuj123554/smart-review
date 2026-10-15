@@ -64,6 +64,24 @@ def line_hash(text: Optional[str]) -> Optional[str]:
         return None
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:LINE_HASH_LEN]
 
+
+def effective_min_severity(raw: Any = None) -> str:
+    """Validates the configured MIN_SEVERITY for inline comments.
+
+    Accepts one of CRITICAL/HIGH/MEDIUM/LOW (case-insensitive); anything
+    else falls back to LOW with a warning. `raw=None` reads the setting
+    (used at startup and whenever a review is posted).
+    """
+    value = raw if raw is not None else getattr(settings, "MIN_SEVERITY", "LOW")
+    label = str(value or "").strip().upper()
+    if label in RISK_ORDER:
+        return label
+    logger.warning(
+        "Invalid MIN_SEVERITY=%r; falling back to LOW (valid values: %s).",
+        value, ", ".join(RISK_ORDER),
+    )
+    return "LOW"
+
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 2.0
 
@@ -96,6 +114,10 @@ class ReviewPoster:
         head_sha: str,
         findings: List[Dict[str, Any]],
         files_analysed: Optional[int] = None,
+        total_files: Optional[int] = None,
+        min_severity: Optional[str] = None,
+        insight_source: Optional[Any] = None,
+        config_applied: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Posts findings as inline comments in one review.
 
@@ -107,8 +129,25 @@ class ReviewPoster:
         again, possibly with reworded LLM messages).
         When `files_analysed` is given, one PR-level summary comment
         (files, severity/category counts, overall risk) is posted after a
-        successful inline review; it is never posted when there are no
-        findings (early return) or when the inline post fails.
+        successful inline review; it is never posted when there are
+        no findings (early return) or when the inline post fails.
+        `insight_source` is an optional zero-argument callable returning
+        history-aware insight lines (queried from the database ONLY after
+        the inline review has posted, then appended to the summary comment
+        as an "Insights" section, up to 3 lines). A source that fails or
+        returns nothing degrades to a summary without the section —
+        insights never break an already-posted review.
+        `config_applied=True` (the repo's .reviewer.yml was fetched and
+        validated) makes the summary comment disclose that a config was
+        applied.
+        When `total_files` (all changed files in the PR) is also given and
+        exceeds `files_analysed`, the summary discloses the truncation,
+        e.g. "Files analysed: 20 of 47 files (27 skipped)".
+        Findings below `min_severity` (defaults to the validated
+        MIN_SEVERITY setting) are NOT posted as inline comments, but are
+        still counted in the summary comment ("N low-severity findings
+        hidden") — and callers remain free to persist them (the DB save
+        happens outside this method with the unfiltered findings).
         Returns the GitHub review JSON, or None when everything was
         duplicate/nothing to post.
         """
@@ -122,11 +161,25 @@ class ReviewPoster:
         # category into one comment, keeping the most severe.
         findings = self._merge_same_line(findings)
 
+        # Severity floor: below-threshold findings never become inline
+        # comments but stay visible in the PR summary counts.
+        min_label = effective_min_severity(min_severity)
+        min_rank = severity_rank(min_label)
+        visible = [f for f in findings
+                   if severity_rank(f.get("severity")) >= min_rank]
+        hidden = [f for f in findings
+                  if severity_rank(f.get("severity")) < min_rank]
+        if hidden:
+            logger.info(
+                "Hiding %d finding(s) below MIN_SEVERITY=%s for %s#%s.",
+                len(hidden), min_label, repo_full_name, pr_number,
+            )
+
         existing = self._existing_bot_comments(repo_full_name, pr_number)
 
         comments: List[Dict[str, Any]] = []
         skipped_dupes = 0
-        for f in findings:
+        for f in visible:
             if self._is_duplicate(f, existing):
                 skipped_dupes += 1
                 continue
@@ -139,27 +192,44 @@ class ReviewPoster:
             })
 
         if not comments:
-            logger.info("All %d finding(s) already posted for %s#%s.",
-                        skipped_dupes, repo_full_name, pr_number)
+            if hidden:
+                logger.info(
+                    "Nothing to post for %s#%s: %d finding(s) hidden below "
+                    "MIN_SEVERITY=%s, %d duplicate(s).",
+                    repo_full_name, pr_number, len(hidden), min_label,
+                    skipped_dupes,
+                )
+            else:
+                logger.info("All %d finding(s) already posted for %s#%s.",
+                            skipped_dupes, repo_full_name, pr_number)
             return None
 
         payload = {
             "commit_id": head_sha,
             "event": "COMMENT",
-            "body": self._summary_body(findings, comments),
+            "body": self._summary_body(visible, comments),
             "comments": comments,
         }
         review = self._post_with_retry(repo_full_name, pr_number, payload)
 
         # Summary comment: only after a successful inline review, and only
         # when the caller told us how many files were analysed (the real
-        # pipeline always does).
+        # pipeline always does). Previous-finding insights are queried NOW —
+        # after the review posted — so the summary reflects history as of
+        # this post; an unusable source just drops the section.
         if files_analysed is not None:
+            insights = self._load_insights(
+                insight_source, repo_full_name, pr_number)
             try:
                 self._post_summary_comment(
                     repo_full_name,
                     pr_number,
-                    self._summary_comment_body(findings, files_analysed),
+                    self._summary_comment_body(
+                        findings, files_analysed, total_files,
+                        hidden=hidden, min_severity_label=min_label,
+                        insights=insights,
+                        config_applied=config_applied,
+                    ),
                 )
             except GitHubPostingError as err:
                 logger.warning(
@@ -169,6 +239,33 @@ class ReviewPoster:
         return review
 
     # --------------------------- internals --------------------------------
+
+    @staticmethod
+    def _load_insights(
+        insight_source: Optional[Any],
+        repo_full_name: str,
+        pr_number: int,
+    ) -> List[str]:
+        """Fetches insight lines from `insight_source`, defensively.
+
+        Returns [] when there is no source, it raises, or it yields nothing
+        — an Insights section is only ever rendered from real, queryable
+        history (never fabricated), and a broken source must not fail a
+        review that already posted.
+        """
+        if insight_source is None:
+            return []
+        try:
+            lines = insight_source()
+        except Exception as err:  # noqa: BLE001 - insights must never fail a post
+            logger.warning(
+                "Insights unavailable for %s#%s: %s",
+                repo_full_name, pr_number, err,
+            )
+            return []
+        cleaned = [str(line).strip() for line in (lines or [])
+                   if str(line).strip()]
+        return cleaned[:3]
 
     @staticmethod
     def _merge_same_line(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -279,10 +376,24 @@ class ReviewPoster:
         return "NONE"
 
     def _summary_comment_body(
-        self, findings: List[Dict[str, Any]], files_analysed: int
+        self,
+        findings: List[Dict[str, Any]],
+        files_analysed: int,
+        total_files: Optional[int] = None,
+        hidden: Optional[List[Dict[str, Any]]] = None,
+        min_severity_label: Optional[str] = None,
+        insights: Optional[List[str]] = None,
+        config_applied: bool = False,
     ) -> str:
         """One PR-level comment: files analysed, severity/category counts,
-        and the overall risk level."""
+        findings hidden by the MIN_SEVERITY filter, and the overall risk
+        level. When not every changed file was analysed, the truncation is
+        disclosed ("20 of 47 files"). Counts always reflect ALL findings,
+        hidden ones included. When `insights` carries history-aware lines
+        (previous findings from the database), an "Insights" section of up
+        to 3 lines is appended; with no lines the section is omitted
+        entirely. `config_applied=True` adds a line disclosing that the
+        repo's .reviewer.yml was applied."""
         sev_counts: Dict[str, int] = {}
         cat_counts: Dict[str, int] = {}
         for f in findings:
@@ -297,14 +408,46 @@ class ReviewPoster:
         cat_str = ", ".join(
             f"{k}: {v}" for k, v in sorted(cat_counts.items())
         )
+        if total_files is not None and total_files > files_analysed:
+            files_line = (
+                f"- Files analysed: {files_analysed} of {total_files} files "
+                f"({total_files - files_analysed} skipped)"
+            )
+        else:
+            files_line = f"- Files analysed: {files_analysed}"
+        config_line = (
+            "- Config: `.reviewer.yml` applied\n" if config_applied else ""
+        )
+        hidden_line = ""
+        if hidden:
+            hidden_counts: Dict[str, int] = {}
+            for f in hidden:
+                sev = str(f.get("severity", "INFO")).upper()
+                hidden_counts[sev] = hidden_counts.get(sev, 0) + 1
+            desc = ", ".join(
+                f"{hidden_counts[s]} {s.lower()}-severity"
+                for s in RISK_ORDER if s in hidden_counts
+            )
+            hidden_line = (
+                f"- {desc} findings hidden "
+                f"(below MIN_SEVERITY={min_severity_label})\n"
+            )
+        insights_block = ""
+        if insights:
+            bullets = "\n".join(
+                f"- {line}" for line in list(insights)[:3]
+            )
+            insights_block = f"\n\n💡 **Insights**\n{bullets}"
         return (
             f"{BOT_MARKER}\n"
             "📊 **Smart Review Assistant — PR review summary**\n"
-            f"- Files analysed: {files_analysed}\n"
+            f"{files_line}\n"
+            f"{config_line}"
+            f"{hidden_line}"
             f"- Findings: {len(findings)} total\n"
             f"- By severity: {sev_str}\n"
             f"- By category: {cat_str}\n"
-            f"- Overall risk: **{risk}**"
+            f"- Overall risk: **{risk}**{insights_block}"
         )
 
     def _post_summary_comment(

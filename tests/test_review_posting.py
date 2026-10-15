@@ -1,12 +1,16 @@
+import logging
+
 import pytest
 
 from unittest.mock import MagicMock
 
+from app.config import settings
 from app.github.comments import (
     ReviewPoster,
     BOT_MARKER,
     LINE_HASH_RE,
     GitHubPostingError,
+    effective_min_severity,
 )
 
 
@@ -203,6 +207,35 @@ def test_summary_comment_posted_after_inline_review(poster, client):
     assert "CRITICAL: 1" in body and "LOW: 1" in body       # by severity
     assert "Security: 1" in body and "Style: 1" in body      # by category
     assert "Overall risk: **CRITICAL**" in body               # highest wins
+
+
+def test_summary_discloses_truncation_when_total_files_given(poster, client):
+    """When not every changed file was analysed, the PR summary says so,
+    e.g. 'Files analysed: 20 of 47 files (27 skipped)'."""
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),    # inline review
+        _resp(201, {"id": 9}),    # summary comment
+    ]
+    result = poster.post_review("o/r", 7, "sha", [_finding()],
+                                files_analysed=20, total_files=47)
+    assert result == {"id": 1}
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Files analysed: 20 of 47 files (27 skipped)" in body
+
+
+def test_summary_plain_file_count_when_nothing_skipped(poster, client):
+    """A fully analysed PR keeps the plain 'Files analysed: N' line."""
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),
+        _resp(201, {"id": 9}),
+    ]
+    poster.post_review("o/r", 7, "sha", [_finding()],
+                       files_analysed=3, total_files=3)
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Files analysed: 3\n" in body
+    assert " of " not in body
 
 
 def test_overall_risk_medium_when_no_higher_severities(poster, client):
@@ -463,3 +496,161 @@ def test_comment_body_embeds_line_hash_only_when_line_text_known(poster, client)
     poster.post_review("o/r", 1, "sha", [_finding()])  # no line_text
     body = client.session.request.call_args.kwargs["json"]["comments"][0]["body"]
     assert LINE_HASH_RE.search(body) is None
+
+
+# --------------------------- MIN_SEVERITY threshold -------------------------
+
+def _mixed_findings():
+    """One finding per severity, on distinct lines."""
+    return [
+        _finding(line=1, message="info", severity="INFO", category="Logic"),
+        _finding(line=2, message="low", severity="LOW", category="Style"),
+        _finding(line=3, message="medium", severity="MEDIUM", category="Bug Risk"),
+        _finding(line=4, message="high", severity="HIGH", category="Security"),
+        _finding(line=5, message="critical", severity="CRITICAL", category="Security"),
+    ]
+
+
+@pytest.mark.parametrize("min_sev,posted_lines", [
+    ("LOW", [2, 3, 4, 5]),        # LOW is the default floor: only INFO hidden
+    ("MEDIUM", [3, 4, 5]),
+    ("HIGH", [4, 5]),
+    ("CRITICAL", [5]),
+])
+def test_min_severity_thresholds_filter_inline_comments(
+        poster, client, min_sev, posted_lines):
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    poster.post_review("o/r", 42, "sha", _mixed_findings(),
+                       min_severity=min_sev)
+    sent = client.session.request.call_args.kwargs["json"]
+    assert [c["line"] for c in sent["comments"]] == posted_lines
+
+
+def test_effective_min_severity_valid_values_case_insensitive():
+    for value in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+        assert effective_min_severity(value) == value
+    assert effective_min_severity("high") == "HIGH"
+    assert effective_min_severity("CRITICAL ") == "CRITICAL"
+
+
+def test_min_severity_invalid_value_falls_back_to_low_with_warning(
+            poster, client, caplog):
+    client.session.request.side_effect = [_resp(200, []), _resp(201, {"id": 1})]
+    with caplog.at_level(logging.WARNING, logger="app.github.comments"):
+        poster.post_review("o/r", 42, "sha", _mixed_findings(),
+                           min_severity="banana")
+    assert any("MIN_SEVERITY" in m and "LOW" in m for m in caplog.messages), \
+        caplog.messages
+    # Falls back to the LOW floor: only the INFO finding is hidden.
+    sent = client.session.request.call_args.kwargs["json"]
+    assert [c["line"] for c in sent["comments"]] == [2, 3, 4, 5]
+
+
+def test_min_severity_setting_read_and_summary_counts_hidden(
+            poster, client, monkeypatch):
+    """post_review without an explicit min_severity reads the MIN_SEVERITY
+    setting; hidden findings are not posted inline but ARE counted in the
+    PR summary ('2 low-severity findings hidden')."""
+    monkeypatch.setattr(settings, "MIN_SEVERITY", "MEDIUM")
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),   # inline review
+        _resp(201, {"id": 9}),   # summary comment
+    ]
+    findings = [
+        _finding(line=1, message="low one", severity="LOW", category="Style"),
+        _finding(line=2, message="low two", severity="LOW", category="Style"),
+        _finding(line=3, message="high one", severity="HIGH", category="Security"),
+    ]
+    result = poster.post_review("o/r", 42, "sha", findings, files_analysed=1)
+    assert result == {"id": 1}
+
+    # Inline review: only the HIGH finding became a comment.
+    review_payload = client.session.request.call_args_list[-2].kwargs["json"]
+    assert [c["line"] for c in review_payload["comments"]] == [3]
+
+    # Summary: hidden findings are disclosed and counted.
+    summary_body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "2 low-severity findings hidden " \
+           "(below MIN_SEVERITY=MEDIUM)" in summary_body
+    assert "Findings: 3 total" in summary_body   # hidden ones still counted
+    assert "By severity: HIGH: 1, LOW: 2" in summary_body
+
+
+# --------------------- history-aware insights section ----------------------
+def test_summary_includes_insights_queried_after_inline_review(poster, client):
+    """The insight source is consulted only AFTER the inline review has
+    been accepted, and its lines are appended to the PR summary comment as
+    an 'Insights' section."""
+    client.session.request.side_effect = [
+        _resp(200, []),        # existing comments
+        _resp(201, {"id": 1}),  # inline review
+        _resp(201, {"id": 9}),  # summary comment
+    ]
+    queried = []
+
+    def source():
+        # Was the inline review already POSTed when the query runs?
+        posted = [c for c in client.session.request.call_args_list
+                  if c.args[0] == "POST"
+                  and c.args[1].endswith("/pulls/7/reviews")]
+        queried.append(bool(posted))
+        return ["Recurring: 2nd 'Security' finding from @alice "
+                "in this repo's last 10 PRs."]
+
+    result = poster.post_review("o/r", 7, "sha", [_finding()],
+                                files_analysed=1, insight_source=source)
+    assert result == {"id": 1}
+    assert queried == [True]  # exactly one query, after the review posted
+
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "💡 **Insights**" in body
+    assert ("- Recurring: 2nd 'Security' finding from @alice "
+            "in this repo's last 10 PRs." in body)
+
+
+def test_insights_not_queried_when_inline_review_never_posts(poster, client):
+    """No posted review -> the previous-finding query never runs."""
+    client.session.request.side_effect = [
+        _resp(200, []),                                  # existing comments
+        _resp(422, {"message": "Validation Failed"}),    # permanent failure
+    ]
+    queried = []
+    with pytest.raises(GitHubPostingError):
+        poster.post_review("o/r", 7, "sha", [_finding()],
+                           files_analysed=1,
+                           insight_source=lambda: queried.append(True) or [])
+    assert queried == []
+
+
+def test_broken_insight_source_still_posts_summary(poster, client):
+    """A failing history query degrades to a summary WITHOUT the section —
+    it must never fail a review that already posted."""
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),
+        _resp(201, {"id": 9}),
+    ]
+
+    def source():
+        raise RuntimeError("database is locked")
+
+    result = poster.post_review("o/r", 7, "sha", [_finding()],
+                                files_analysed=1, insight_source=source)
+    assert result == {"id": 1}
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Insights" not in body
+    assert "Findings: 1 total" in body  # the summary itself is intact
+
+
+def test_empty_insight_source_adds_no_section(poster, client):
+    """No history -> the source yields nothing -> no section at all."""
+    client.session.request.side_effect = [
+        _resp(200, []),
+        _resp(201, {"id": 1}),
+        _resp(201, {"id": 9}),
+    ]
+    poster.post_review("o/r", 7, "sha", [_finding()],
+                       files_analysed=1, insight_source=lambda: [])
+    body = client.session.request.call_args.kwargs["json"]["body"]
+    assert "Insights" not in body

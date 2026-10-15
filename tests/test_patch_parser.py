@@ -170,6 +170,37 @@ def test_parse_files_payload_global_max_lines_cap():
     assert len(parsed[1].added_lines) == 1
     assert parsed[1].truncated is True
 
+def test_parse_files_payload_max_lines_per_file_caps_each_file():
+    """MAX_LINES_PER_FILE: each file keeps at most N added lines and is
+    flagged truncated; the per-file cap does NOT exhaust later files."""
+    files = [
+        {"filename": "a.py", "status": "modified",
+         "patch": "@@ -1 +1,4 @@\n-a\n+x\n+y\n+z\n"},   # 3 added lines
+        {"filename": "b.py", "status": "modified",
+         "patch": "@@ -1 +1,3 @@\n-b\n+p\n+q\n"},     # 2 added lines
+    ]
+    parsed = parse_files_payload(files, max_lines_per_file=2)
+    assert [p.path for p in parsed] == ["a.py", "b.py"]
+    assert len(parsed[0].added_lines) == 2
+    assert parsed[0].truncated is True     # 3 added lines vs cap 2
+    assert len(parsed[1].added_lines) == 2
+    assert parsed[1].truncated is False    # per-file cap never exhausts others
+
+
+def test_parse_files_payload_per_file_cap_never_exceeds_global_budget():
+    files = [
+        {"filename": "a.py", "status": "modified",
+         "patch": "@@ -1 +1,5 @@\n-a\n+x\n+y\n+z\n+w\n"},   # 4 added lines
+        {"filename": "b.py", "status": "modified",
+         "patch": "@@ -1 +1,4 @@\n-b\n+p\n+q\n+r\n"},      # 3 added lines
+    ]
+    # Global budget (3) is smaller than the per-file cap: the first file
+    # must not take more than the remaining global allowance.
+    parsed = parse_files_payload(files, max_lines=3, max_lines_per_file=10)
+    assert len(parsed) == 1
+    assert len(parsed[0].added_lines) == 3
+    assert parsed[0].truncated is True
+
 
 
 def test_parse_files_payload_renamed_only_file_has_no_added_lines_skipped():

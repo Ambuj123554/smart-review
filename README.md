@@ -14,8 +14,11 @@ Target users: small student and open-source teams with no dedicated reviewer.
    the `X-Hub-Signature-256` HMAC signature.
 2. **Diff fetching** — `GET /repos/{owner}/{repo}/pulls/{n}/files` (paginated,
    capped by `MAX_FILES_PER_PR` / `GITHUB_MAX_LINES`) parsed into per-file
-   added lines on the new side of the diff. Binary files, deleted files and
-   files without patches are skipped.
+   added lines on the new side of the diff. Binary files, deleted files,
+   lockfiles, minified bundles and generated files are skipped *before* the
+   file cap is applied, and each file's added lines are capped by
+   `MAX_LINES_PER_FILE`. When a PR is truncated the run logs a warning and
+   the PR summary comment discloses it (e.g. "Files analysed: 20 of 47 files").
 3. **LLM review** — each file's added lines are sent to the configured
    provider (Gemini by default, or Groq via `LLM_PROVIDER=groq`) with a
    prompt that (a) marks the diff content as untrusted input, (b) demands a
@@ -52,6 +55,52 @@ GitHub ──webhook──►  app/main.py (FastAPI)
                         └── GET  /health
 ```
 
+## Per-repository review config (`.reviewer.yml`)
+
+Drop an optional `.reviewer.yml` into the **root of the reviewed
+repository** to tune the reviewer per repo. It is fetched through the
+GitHub contents API **at the PR's head SHA**, so a pull request can
+preview its own review settings. If the file is missing or fails
+validation, the review runs on defaults and a warning is logged — a
+broken config never fails or blocks a review.
+
+```yaml
+# .reviewer.yml — every key is optional
+
+# Skip files from analysis (fnmatch-style globs on the repo-relative path)
+ignore_paths:
+  - tests/**
+  - docs/**
+  - "*.md"
+
+# Lowest severity posted as an inline comment.
+# The app-wide MIN_SEVERITY setting applies when this key is absent.
+min_severity: MEDIUM
+
+# Rule IDs to switch off entirely — findings from these rules are
+# neither posted, nor summarised, nor stored.
+disable_rules:
+  - AST-004
+  - AI-DIFF-001
+
+# Short free-text guidance appended to the LLM review prompt, e.g.
+# "We don't use type hints; don't flag them." Capped at 500 characters.
+custom_instructions: We don't use type hints; don't flag them.
+```
+
+Validation and safety:
+
+- Values are strictly validated; **any** problem — malformed YAML, a
+  wrong type, an unknown key, a bad severity or rule id — rejects the
+  whole file, logs a warning, and falls back to defaults.
+- The file is treated as **untrusted input** (any PR author can edit
+  it): it is parsed with a safe YAML loader, `custom_instructions` is
+  capped at 500 characters and stripped of control characters, and it
+  reaches the prompt only as fenced data that cannot override the
+  model's instructions or surface secrets.
+- When a config was applied, the PR summary comment discloses it with
+  `- Config: .reviewer.yml applied`.
+
 ## Setup
 
 ### 1. Requirements
@@ -79,8 +128,10 @@ Copy `.env.example` to `.env` and fill in:
 | `LLM_PROVIDER` | no | LLM backend: `gemini` (default) or `groq` |
 | `GROQ_API_KEY` | only for groq | Groq API key (`gsk_...`) |
 | `GROQ_MODEL` | no | Groq model id, defaults to `llama-3.3-70b-versatile` |
-| `MAX_FILES_PER_PR` | no | Max files per PR analysed (default 20) |
+| `MAX_FILES_PER_PR` | no | Max files per PR analysed, after skipping binary/deleted/lock/minified/generated files (default 20) |
+| `MAX_LINES_PER_FILE` | no | Max added lines analysed per file (default 800) |
 | `GITHUB_MAX_LINES` | no | Max added lines per PR analysed (default 3000) |
+| `MIN_SEVERITY` | no | Lowest severity posted as an inline comment: `LOW` (default), `MEDIUM`, `HIGH` or `CRITICAL`; lower findings are still saved to the DB and counted in the PR summary ("N low-severity findings hidden"). Invalid values fall back to `LOW` with a startup warning |
 | `DATABASE_PATH` | no | SQLite file (default `reviews.db`) |
 | `HOST` / `PORT` / `DEBUG` | no | Server settings |
 

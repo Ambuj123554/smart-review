@@ -66,5 +66,8 @@ def test_get_stats_endpoint_200(client):
     resp = client.get("/stats")
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data.keys()) == {"total_findings", "by_severity", "by_category", "by_repo"}
+    # total_reviews was added for the /dashboard page (additive change).
+    assert set(data.keys()) == {"total_reviews", "total_findings",
+                                "by_severity", "by_category", "by_repo"}
+    assert isinstance(data["total_reviews"], int)
     assert isinstance(data["total_findings"], int)
